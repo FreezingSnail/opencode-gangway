@@ -162,6 +162,7 @@ export function registerCodexTools(
         "Start an OpenCode implementation session (defaults to model opencode-go/deepseek-v4.1-flash) and send it an initial prompt. Returns the session ID; pass wait=true to block until the run finishes.",
       inputSchema: {
         prompt: z.string().describe("Implementation task for the OpenCode session"),
+        sessionID: z.string().optional().describe("Attach to an existing session instead of creating one"),
         title: z.string().optional().describe("Session title; gets a [codex] prefix"),
         directory: z.string().optional().describe("Project directory; defaults to the plugin instance location"),
         agent: z.string().optional().describe("OpenCode agent ID"),
@@ -171,6 +172,15 @@ export function registerCodexTools(
       },
     },
     async (args) => {
+      if (args.sessionID) {
+        await ctx.session.get({ sessionID: args.sessionID })
+        await ctx.session.prompt({ sessionID: args.sessionID, text: args.prompt })
+        if (!args.wait) return reply({ sessionID: args.sessionID, status: "queued" })
+        const idle = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
+        const latest = await lastAssistant(ctx, args.sessionID)
+        return reply({ sessionID: args.sessionID, status: idle ? "idle" : "busy", ...latest })
+      }
+
       const model = parseModel(args.model)
       const title = `${TAG} ${args.title ?? short(args.prompt)}`
       const created = await ctx.session.create({

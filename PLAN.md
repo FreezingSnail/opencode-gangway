@@ -115,9 +115,14 @@ live in the TUI session list for their project directory, streamable, interrupti
 ## Milestones
 
 0. **Spike** — done, see above.
-1. Core tools + storage registry + idle tracking.
-2. Agent/permission policy + per-call directory targeting + model validation.
-3. Tests (bun test, co-located; M0-style end-to-end run), README, global install.
+1. **Core tools** — done: start/prompt/wait/status/result/interrupt/list verified live on
+   deepseek-v4.1-flash; storage registry, `[codex]` titles, directory targeting,
+   attach-to-existing-session.
+2. **Permissions / multi-instance** — done: session-scoped ruleset (runtime action is
+   `shell`, not `bash`; deny mirror of the global policy, ask→deny so runs never stall);
+   port-collision guard unit-tested. Default agent = OpenCode's configured default.
+3. **Install + polish** — global config entry + service restart (user action), then a real
+   `codex exec` implementation task end-to-end.
 
 ## Risks
 
