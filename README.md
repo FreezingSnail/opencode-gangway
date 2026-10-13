@@ -38,10 +38,10 @@ RUN_LIVE=1 bun test
 ## Codex setup
 
 ```sh
-codex mcp add opencode-impl --url http://127.0.0.1:4787/mcp
+codex mcp add gangway --url http://127.0.0.1:4787/mcp
 ```
 
-Add to `~/.codex/config.toml` under `[mcp_servers.opencode-impl]`:
+Add to `~/.codex/config.toml` under `[mcp_servers.gangway]`:
 
 ```toml
 default_tools_approval_mode = "approve"
