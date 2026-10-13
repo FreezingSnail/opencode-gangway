@@ -48,8 +48,8 @@ validated against `ctx.model.list()`.
 
 | Tool | Args | Behavior |
 |---|---|---|
-| `opencode_start_session` | `prompt`, `title?`, `directory?`, `agent?`, `model?`, `wait?` | create session (location=directory), switch model, prompt; returns `{sessionID}` |
-| `opencode_prompt` | `sessionID`, `text`, `wait?` | follow-up prompt |
+| `opencode_start_session` | `prompt`, `title?`, `directory?`, `agent?`, `model?`, `wait?`, `sessionID?` | create session (location=directory), switch model, prompt; returns `{sessionID}`; `sessionID` attaches to existing |
+| `opencode_prompt` | `sessionID`, `text`, `wait?` | follow-up prompt (attach to any session) |
 | `opencode_wait` | `sessionID`, `timeoutMs?` | block until idle; return last assistant text + usage |
 | `opencode_status` | `sessionID` | busy/idle, last text tail, error info |
 | `opencode_result` | `sessionID` | final assistant text, model, usage |
@@ -97,6 +97,20 @@ Global install path (M1, verify): `"plugins": [{ "package":
 "/Users/connorfranc/dev/opencode-codex-mcp/src/plugin.ts", "options": { "port": 4787 } }]`
 in `~/.config/opencode/opencode.jsonc` (absolute file target accepted per docs).
 Requires an OpenCode service restart, which ends the current TUI session — user action.
+
+## Watchability (TUI)
+
+Codex-created sessions are ordinary OpenCode sessions in the same service → visible
+live in the TUI session list for their project directory, streamable, interruptible.
+
+- Sessions get titles prefixed `[codex]` so they are identifiable in lists.
+- `opencode_start_session` / `opencode_prompt` accept optional `sessionID` to attach
+  to an existing session instead of creating one (watch-first workflow: user opens a
+  session, Codex drives it).
+- Sessions are created at the location matching their `directory`, so the TUI shows
+  them under that project.
+- Spike caveat: while only the private dev server hosts the endpoint, TUI (shared
+  service) does not see those sessions. Production install fixes this.
 
 ## Milestones
 
