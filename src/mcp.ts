@@ -33,7 +33,10 @@ function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown
   if (ctx) {
     const configured =
       typeof pluginOptions.defaultWaitMs === "number" ? (pluginOptions.defaultWaitMs as number) : undefined
-    registerCodexTools(server, ctx, { defaultWaitMs: configured })
+    registerCodexTools(server, ctx, {
+      defaultWaitMs: configured,
+      inheritPermissions: pluginOptions.inheritPermissions === true,
+    })
   }
 
   return server

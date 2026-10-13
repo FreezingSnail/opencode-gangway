@@ -6,6 +6,36 @@ export const DEFAULT_MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-fla
 export const DEFAULT_WAIT_MS = 10 * 60 * 1000
 export const DEFAULT_MAX_CHARS = 20_000
 
+// Unattended sessions cannot answer permission prompts, so the bridge installs a
+// session-scoped ruleset at create time. It mirrors the user's global policy, but
+// turns "ask" decisions into "deny" so the agent gets an error instead of stalling.
+export const UNATTENDED_DENY: Array<{ action: string; resource: string }> = [
+  { action: "shell", resource: "perl*" },
+  { action: "shell", resource: "ruby*" },
+  { action: "shell", resource: "lua*" },
+  { action: "shell", resource: "php*" },
+  { action: "shell", resource: "Rscript*" },
+  { action: "shell", resource: "gem*" },
+  { action: "shell", resource: "cpan*" },
+  { action: "shell", resource: "rm -rf *" },
+  { action: "shell", resource: "git push*" },
+  { action: "shell", resource: "git clone*" },
+  { action: "shell", resource: "git submodule*" },
+  { action: "shell", resource: "wget*" },
+  { action: "shell", resource: "curl*-o*" },
+  { action: "shell", resource: "curl*--output*" },
+  { action: "shell", resource: "DROP *" },
+]
+
+function unattendedRuleset(): Array<{ action: string; resource: string; effect: string }> {
+  return [
+    { action: "edit", resource: "*", effect: "allow" },
+    { action: "shell", resource: "*", effect: "allow" },
+    ...UNATTENDED_DENY.map((rule) => ({ ...rule, effect: "deny" })),
+  ]
+}
+
+
 // Minimal structural view of the OpenCode plugin context. Intentionally loose:
 // the runtime shape is the contract (see the server OpenAPI document), and the
 // published types may lag the installed service version.
@@ -117,8 +147,13 @@ function reply(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 1) }] }
 }
 
-export function registerCodexTools(server: McpServer, ctx: Ctx, options: { defaultWaitMs?: number } = {}) {
+export function registerCodexTools(
+  server: McpServer,
+  ctx: Ctx,
+  options: { defaultWaitMs?: number; inheritPermissions?: boolean } = {},
+) {
   const defaultWaitMs = options.defaultWaitMs ?? DEFAULT_WAIT_MS
+  const permissions = options.inheritPermissions ? undefined : unattendedRuleset()
 
   server.registerTool(
     "opencode_start_session",
@@ -143,6 +178,7 @@ export function registerCodexTools(server: McpServer, ctx: Ctx, options: { defau
         model,
         ...(args.directory ? { location: { directory: args.directory } } : {}),
         ...(args.agent ? { agent: args.agent } : {}),
+        ...(permissions ? { permissions } : {}),
         metadata: { codexMcp: true },
       })
       await ctx.session.prompt({ sessionID: created.id, text: args.prompt })
