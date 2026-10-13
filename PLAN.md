@@ -36,8 +36,8 @@ Global (production) load: add to `~/.config/opencode/opencode.jsonc`:
 
 ⚠ Config note: current global config uses the legacy `"plugin"` singular key and a
 V1-style plugin export (slugineer). V2 loading (`plugins`, `@opencode/plugin`,
-`Plugin.define`) is verified in this spike for the project-local path; the global
-path must be verified after a service restart before shipping.
+`Plugin.define`) is verified for both the project-local path and the global
+directory path on OpenCode 2.0.15.
 
 ## Model
 
@@ -93,10 +93,16 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
 - Side-finding: the global slugineer plugin fails to load under opencode 2.0.15
   (config `plugin` entry is treated as an npm package target). Pre-existing; separate fix.
 
-Global install path (M1, verify): `"plugins": [{ "package":
-"/path/to/gangway/src/plugin.ts", "options": { "port": 4787 } }]`
-in `~/.config/opencode/opencode.jsonc` (absolute file target accepted per docs).
-Requires an OpenCode service restart, which ends the current TUI session — user action.
+Global install path: `"plugins": [{ "package":
+"/path/to/gangway", "options": { "port": 4787 } }]`
+in `~/.config/opencode/opencode.jsonc`. Configured paths must be directories:
+the installed OpenCode 2.0.15 rejects a `src/plugin.ts` target before setup runs.
+The root `index.ts` provides the directory entry point; `test/plugin.test.ts`
+verifies resolution and import using OpenCode's plugin host.
+Reload the project location or restart the service after installing.
+Verified on 2026-10-13: the existing shared service loaded the corrected directory
+target without a restart, served MCP ping and all session tools, and completed an
+`opencode-go/deepseek-v4.1-flash` session replying `OK`. Endpoint and loader tests pass.
 
 ## Watchability (TUI)
 
@@ -121,8 +127,8 @@ live in the TUI session list for their project directory, streamable, interrupti
 2. **Permissions / multi-instance** — done: session-scoped ruleset (runtime action is
    `shell`, not `bash`; deny mirror of the global policy, ask→deny so runs never stall);
    port-collision guard unit-tested. Default agent = OpenCode's configured default.
-3. **Install + polish** — global config entry + service restart (user action), then a real
-   `codex exec` implementation task end-to-end.
+3. **Install + polish** — global directory config and a live MCP session verified on the
+   shared service; a real `codex exec` implementation task remains to be verified.
 
 ## Risks
 

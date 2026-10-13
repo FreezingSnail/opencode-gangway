@@ -3,7 +3,7 @@
 MCP bridge that lets Codex start and drive OpenCode implementation sessions running
 `opencode-go/deepseek-v4.1-flash`. Local machine only: the endpoint binds `127.0.0.1`.
 
-Status: **M1** — session tools verified end-to-end; global install pending.
+Global loading and a live model session verified on OpenCode 2.0.15.
 
 ## Tools
 
@@ -50,27 +50,34 @@ default_tools_approval_mode = "approve"
 MCP clients time out long tool calls (SDK default 60s), so prefer
 `opencode_start_session` without `wait`, then `opencode_wait` / `opencode_status`.
 
-## Global install (pending)
+## Global install
 
 `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 {
   "plugins": [
-    { "package": "/path/to/gangway/src/plugin.ts", "options": { "port": 4787 } }
+    { "package": "/path/to/gangway", "options": { "port": 4787 } }
   ]
 }
 ```
 
-Then restart the OpenCode service (this ends any open TUI session). Multiple locations
-load the plugin; the first instance owns `127.0.0.1:4787`, the rest skip (port-collision
+The package path must be an absolute **directory**, not `src/plugin.ts`. OpenCode
+rejects configured file paths with `configured plugin path must be a directory`.
+The root `index.ts` exports the plugin for directory loading.
+
+Reload the project location or restart the OpenCode service to activate it (a restart
+ends any open TUI session). Multiple locations load the plugin; the first instance
+owns `127.0.0.1:4787`, the rest skip (port-collision
 guard covered by `test/server.test.ts`). A rendezvous file is written to
 `~/.config/opencode/gangway.json` while the endpoint is live.
 
 ## Layout
 
 - `src/plugin.ts` — plugin entry (`Plugin.define`), binds the MCP server, rendezvous file.
+- `index.ts` — package directory entry point for the global OpenCode loader.
 - `src/mcp.ts` — MCP server (streamable HTTP, stateless) + tool registration.
 - `src/tools.ts` — session tools, permission ruleset, wait/result logic.
 - `test/mcp.test.ts` — endpoint suite + `RUN_LIVE` session suite.
 - `test/server.test.ts` — port collision / lifecycle.
+- `test/plugin.test.ts` — package directory resolution and import.

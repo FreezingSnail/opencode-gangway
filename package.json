@@ -4,6 +4,7 @@
   "license": "MIT",
   "private": true,
   "type": "module",
+  "main": "./index.ts",
   "scripts": {
     "test": "bun test"
   },
