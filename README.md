@@ -57,7 +57,7 @@ MCP clients time out long tool calls (SDK default 60s), so prefer
 ```jsonc
 {
   "plugins": [
-    { "package": "/Users/connorfranc/dev/gangway/src/plugin.ts", "options": { "port": 4787 } }
+    { "package": "/path/to/gangway/src/plugin.ts", "options": { "port": 4787 } }
   ]
 }
 ```

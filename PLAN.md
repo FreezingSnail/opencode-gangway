@@ -32,7 +32,7 @@ Codex  --(streamable HTTP MCP, loopback)-->  plugin inside OpenCode service  --(
 ```
 
 Global (production) load: add to `~/.config/opencode/opencode.jsonc`:
-`"plugins": [{ "package": "/Users/connorfranc/dev/gangway", "options": { "port": 4787 } }]`
+`"plugins": [{ "package": "/path/to/gangway", "options": { "port": 4787 } }]`
 
 ⚠ Config note: current global config uses the legacy `"plugin"` singular key and a
 V1-style plugin export (slugineer). V2 loading (`plugins`, `@opencode/plugin`,
@@ -94,7 +94,7 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
   (config `plugin` entry is treated as an npm package target). Pre-existing; separate fix.
 
 Global install path (M1, verify): `"plugins": [{ "package":
-"/Users/connorfranc/dev/gangway/src/plugin.ts", "options": { "port": 4787 } }]`
+"/path/to/gangway/src/plugin.ts", "options": { "port": 4787 } }]`
 in `~/.config/opencode/opencode.jsonc` (absolute file target accepted per docs).
 Requires an OpenCode service restart, which ends the current TUI session — user action.
 

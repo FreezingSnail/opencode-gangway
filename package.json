@@ -1,5 +1,7 @@
 {
   "name": "gangway",
+  "description": "MCP bridge between Codex and OpenCode implementation sessions",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
