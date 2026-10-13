@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 
-// Integration tests against a running codex-mcp endpoint
+// Integration tests against a running gangway endpoint
 // (default http://127.0.0.1:4787/mcp, override with MCP_URL).
 //
 // The static suite runs whenever the endpoint answers. The live suite spawns real
@@ -28,7 +28,7 @@ async function reachable(): Promise<boolean> {
 const up = await reachable()
 
 async function connect(): Promise<Client> {
-  const client = new Client({ name: "codex-mcp-test", version: "0.0.1", requestTimeout: 55_000 })
+  const client = new Client({ name: "gangway-test", version: "0.0.1", requestTimeout: 55_000 })
   await client.connect(new StreamableHTTPClientTransport(new URL(url)))
   return client
 }
@@ -45,7 +45,7 @@ function textOf(result: unknown): string {
 
 const maybe = up ? describe : describe.skip
 
-maybe("codex-mcp endpoint", () => {
+maybe("gangway endpoint", () => {
   test("initialize, list tools, call ping", async () => {
     const client = await connect()
 

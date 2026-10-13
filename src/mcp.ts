@@ -17,7 +17,7 @@ export interface StartOptions {
 }
 
 function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown>): McpServer {
-  const server = new McpServer({ name: "opencode-codex-mcp", version: "0.2.0" })
+  const server = new McpServer({ name: "gangway", version: "0.2.0" })
 
   server.registerTool(
     "opencode_ping",

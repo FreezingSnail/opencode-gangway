@@ -1,4 +1,4 @@
-# opencode-codex-mcp
+# gangway
 
 MCP bridge that lets Codex start and drive OpenCode implementation sessions running
 `opencode-go/deepseek-v4.1-flash`. Local machine only: the endpoint binds `127.0.0.1`.
@@ -57,7 +57,7 @@ MCP clients time out long tool calls (SDK default 60s), so prefer
 ```jsonc
 {
   "plugins": [
-    { "package": "/Users/connorfranc/dev/opencode-codex-mcp/src/plugin.ts", "options": { "port": 4787 } }
+    { "package": "/Users/connorfranc/dev/gangway/src/plugin.ts", "options": { "port": 4787 } }
   ]
 }
 ```
@@ -65,7 +65,7 @@ MCP clients time out long tool calls (SDK default 60s), so prefer
 Then restart the OpenCode service (this ends any open TUI session). Multiple locations
 load the plugin; the first instance owns `127.0.0.1:4787`, the rest skip (port-collision
 guard covered by `test/server.test.ts`). A rendezvous file is written to
-`~/.config/opencode/codex-mcp.json` while the endpoint is live.
+`~/.config/opencode/gangway.json` while the endpoint is live.
 
 ## Layout
 

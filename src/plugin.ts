@@ -5,7 +5,7 @@ import { Plugin } from "@opencode/plugin"
 import { DEFAULT_PORT, startMcpServer, type McpServerHandle } from "./mcp"
 import type { Ctx } from "./tools"
 
-const LOG = "[codex-mcp]"
+const LOG = "[gangway]"
 
 function configDir(): string {
   return process.env.XDG_CONFIG_HOME
@@ -14,7 +14,7 @@ function configDir(): string {
 }
 
 export default Plugin.define({
-  id: "codex-mcp",
+  id: "gangway",
   setup(ctx) {
     const port =
       typeof ctx.options?.port === "number" && Number.isInteger(ctx.options.port)
@@ -35,7 +35,7 @@ export default Plugin.define({
       return
     }
 
-    const rendezvous = join(configDir(), "codex-mcp.json")
+    const rendezvous = join(configDir(), "gangway.json")
     try {
       mkdirSync(dirname(rendezvous), { recursive: true })
       writeFileSync(

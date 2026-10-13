@@ -1,4 +1,4 @@
-# opencode-codex-mcp — plan
+# gangway — plan
 
 Goal: let Codex (MCP client) start and drive OpenCode implementation sessions that run on
 `opencode-go/deepseek-v4.1-flash`, from any project directory.
@@ -21,8 +21,8 @@ Codex  --(streamable HTTP MCP, loopback)-->  plugin inside OpenCode service  --(
 ## Layout
 
 ```
-~/dev/opencode-codex-mcp            own git repo, loaded via global config `plugins` path
-  .opencode/plugins/codex-mcp/      project-local load path (spike/dev)
+~/dev/gangway                        own git repo, loaded via global config `plugins` path
+  .opencode/plugins/gangway/        project-local load path (spike/dev)
   src/plugin.ts                     Plugin.define → setup: bind server, rendezvous file, cleanup
   src/mcp.ts                        MCP server + tool registration; Bun.serve fetch handler
   src/tools.ts                      ctx calls: session create/switchModel/prompt/wait/interrupt,
@@ -32,7 +32,7 @@ Codex  --(streamable HTTP MCP, loopback)-->  plugin inside OpenCode service  --(
 ```
 
 Global (production) load: add to `~/.config/opencode/opencode.jsonc`:
-`"plugins": [{ "package": "/Users/connorfranc/dev/opencode-codex-mcp", "options": { "port": 4787 } }]`
+`"plugins": [{ "package": "/Users/connorfranc/dev/gangway", "options": { "port": 4787 } }]`
 
 ⚠ Config note: current global config uses the legacy `"plugin"` singular key and a
 V1-style plugin export (slugineer). V2 loading (`plugins`, `@opencode/plugin`,
@@ -70,13 +70,13 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
 - Bind `127.0.0.1` only. Optional static token (plugin option → Codex
   `--bearer-token-env-var`).
 - Port default `4787`, plugin option. EADDRINUSE → health-probe; skip quietly if ours.
-- Rendezvous file `~/.config/opencode/codex-mcp.json` `{url, port, pid}` written on
+- Rendezvous file `~/.config/opencode/gangway.json` `{url, port, pid}` written on
   start, removed on stop.
-- Logs: `console.error` prefixed `[codex-mcp]`, visible with `--print-logs`.
+- Logs: `console.error` prefixed `[gangway]`, visible with `--print-logs`.
 
 ## M0 spike results (done)
 
-- Plugin loads from `.opencode/plugins/codex-mcp/index.ts` (dir + index.ts, no
+- Plugin loads from `.opencode/plugins/gangway/index.ts` (dir + index.ts, no
   package.json needed) — state `active` per `GET /api/plugin`.
 - Locations build lazily: on a fresh server the plugin activates once the location is
   built (`POST /api/location/reload` forces it). In production the global `plugins`
@@ -94,7 +94,7 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
   (config `plugin` entry is treated as an npm package target). Pre-existing; separate fix.
 
 Global install path (M1, verify): `"plugins": [{ "package":
-"/Users/connorfranc/dev/opencode-codex-mcp/src/plugin.ts", "options": { "port": 4787 } }]`
+"/Users/connorfranc/dev/gangway/src/plugin.ts", "options": { "port": 4787 } }]`
 in `~/.config/opencode/opencode.jsonc` (absolute file target accepted per docs).
 Requires an OpenCode service restart, which ends the current TUI session — user action.
 
