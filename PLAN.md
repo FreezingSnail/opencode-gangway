@@ -69,9 +69,11 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
 
 - Bind `127.0.0.1` only. Optional static token (plugin option → Codex
   `--bearer-token-env-var`).
-- Port default `4787`, plugin option. EADDRINUSE → health-probe; skip quietly if ours.
-- Rendezvous file `~/.config/opencode/gangway.json` `{url, port, pid}` written on
-  start, removed on stop.
+- Port default `4787`, plugin option. Process-wide leases share the endpoint across
+  locations and module reloads; external bind collisions fail plugin setup.
+- Rendezvous file `~/.local/state/gangway/endpoint.json` `{url, port, pid}` written on
+  first acquisition, removed on final release. Honor `XDG_STATE_HOME`; never write
+  runtime metadata into OpenCode's watched configuration directories.
 - Logs: `console.error` prefixed `[gangway]`, visible with `--print-logs`.
 
 ## M0 spike results (done)
@@ -137,3 +139,23 @@ live in the TUI session list for their project directory, streamable, interrupti
   JSON-RPC (~150 LOC).
 - `ctx.session.wait` / status semantics on 2.0.15 → event sub + poll fallback.
 - Legacy vs V2 plugin config shape on the installed opencode → verified per load path.
+
+## 2026-10-13 recovery
+
+The shared service stopped admitting prompts while Gangway's endpoint was absent.
+New sessions remained at zero tokens in `SessionPrompt.prepare`; plugin inventory
+still reported Gangway active. Isolating Gangway and restarting restored normal
+prompt completion. Configuration watching includes the old rendezvous directory,
+so runtime writes there can feed configuration reloads.
+
+The repair moves rendezvous metadata into the state directory and gives every
+plugin instance a lease on a process-wide endpoint. Requests use a remaining live
+context after the original owner unloads. External collisions now fail setup.
+An already-failing legacy plugin entry was removed from the local OpenCode config
+while isolating the service issue.
+
+Verified: lifecycle handover and cleanup, ordinary OpenCode prompt completion,
+live MCP start/wait/result on deepseek-v4.1-flash, no plugin/config update events
+during an eight-second observation, and MCP ping after explicit location reload.
+OpenCode 2.0.15 still logs source discovery periodically; discovery logs alone do
+not demonstrate plugin reactivation.

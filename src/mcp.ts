@@ -14,6 +14,8 @@ export interface StartOptions {
   hostname?: string
   ctx?: Ctx
   pluginOptions?: Record<string, unknown>
+  // Resolve the current plugin owner when each request arrives.
+  context?: () => { ctx: Ctx; pluginOptions: Record<string, unknown> }
 }
 
 function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown>): McpServer {
@@ -56,7 +58,8 @@ export function startMcpServer(options: StartOptions = {}): McpServerHandle {
         return new Response("not found", { status: 404 })
       }
       // Stateless mode: fresh server + transport per request.
-      const server = buildServer(options.ctx, pluginOptions)
+      const current = options.context?.()
+      const server = buildServer(current?.ctx ?? options.ctx, current?.pluginOptions ?? pluginOptions)
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

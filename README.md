@@ -67,16 +67,22 @@ rejects configured file paths with `configured plugin path must be a directory`.
 The root `index.ts` exports the plugin for directory loading.
 
 Reload the project location or restart the OpenCode service to activate it (a restart
-ends any open TUI session). Multiple locations load the plugin; the first instance
-owns `127.0.0.1:4787`, the rest skip (port-collision
-guard covered by `test/server.test.ts`). A rendezvous file is written to
-`~/.config/opencode/gangway.json` while the endpoint is live.
+ends any open TUI session). Multiple locations share `127.0.0.1:4787` through
+process-wide leases. When one location unloads, a remaining location takes over
+request handling; the final unload closes the endpoint. An external port collision
+is reported as a plugin failure.
+
+The rendezvous file lives at `~/.local/state/gangway/endpoint.json`
+(`$XDG_STATE_HOME/gangway/endpoint.json` when configured). It must stay outside
+OpenCode's watched configuration directories: writing it there can trigger repeated
+configuration reloads and block prompt admission.
 
 ## Layout
 
 - `src/plugin.ts` — plugin entry (`Plugin.define`), binds the MCP server, rendezvous file.
 - `index.ts` — package directory entry point for the global OpenCode loader.
 - `src/mcp.ts` — MCP server (streamable HTTP, stateless) + tool registration.
+- `src/lifecycle.ts` — shared endpoint leases and ownership transfer.
 - `src/tools.ts` — session tools, permission ruleset, wait/result logic.
 - `test/mcp.test.ts` — endpoint suite + `RUN_LIVE` session suite.
 - `test/server.test.ts` — port collision / lifecycle.
