@@ -1,0 +1,14 @@
+{
+  "name": "opencode-codex-mcp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.28"
+  }
+}

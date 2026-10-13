@@ -1,0 +1,91 @@
+# opencode-codex-mcp — plan
+
+Goal: let Codex (MCP client) start and drive OpenCode implementation sessions that run on
+`opencode-go/deepseek-v4.1-flash`, from any project directory.
+
+## Architecture
+
+```
+Codex  --(streamable HTTP MCP, loopback)-->  plugin inside OpenCode service  --(ctx)-->  sessions
+```
+
+- Plugin hosts an MCP server in-process (Bun.serve + `@modelcontextprotocol/sdk`
+  `WebStandardStreamableHTTPServerTransport`, stateless mode).
+- Codex registers it with: `codex mcp add opencode-impl --url http://127.0.0.1:4787/mcp`
+  (verified supported: codex-cli 0.162; optional `--bearer-token-env-var`).
+- No extra daemon: the plugin lives inside the OpenCode service and talks to sessions
+  through `ctx` (same contract as the client/SDK).
+- Fallback if the MCP HTTP client handshake misbehaves: stdio shim process spawned by
+  Codex that proxies to the same HTTP endpoint.
+
+## Layout
+
+```
+~/dev/opencode-codex-mcp            own git repo, loaded via global config `plugins` path
+  .opencode/plugins/codex-mcp/      project-local load path (spike/dev)
+  src/plugin.ts                     Plugin.define → setup: bind server, rendezvous file, cleanup
+  src/mcp.ts                        MCP server + tool registration; Bun.serve fetch handler
+  src/tools.ts                      ctx calls: session create/switchModel/prompt/wait/interrupt,
+                                    storage registry, idle tracking
+  test/                             bun test; integration test connects a real MCP client
+  PLAN.md, README.md
+```
+
+Global (production) load: add to `~/.config/opencode/opencode.jsonc`:
+`"plugins": [{ "package": "/Users/connorfranc/dev/opencode-codex-mcp", "options": { "port": 4787 } }]`
+
+⚠ Config note: current global config uses the legacy `"plugin"` singular key and a
+V1-style plugin export (slugineer). V2 loading (`plugins`, `@opencode/plugin`,
+`Plugin.define`) is verified in this spike for the project-local path; the global
+path must be verified after a service restart before shipping.
+
+## Model
+
+Default `opencode-go/deepseek-v4.1-flash` (verified available), per-call override,
+validated against `ctx.model.list()`.
+
+## MCP tools
+
+| Tool | Args | Behavior |
+|---|---|---|
+| `opencode_start_session` | `prompt`, `title?`, `directory?`, `agent?`, `model?`, `wait?` | create session (location=directory), switch model, prompt; returns `{sessionID}` |
+| `opencode_prompt` | `sessionID`, `text`, `wait?` | follow-up prompt |
+| `opencode_wait` | `sessionID`, `timeoutMs?` | block until idle; return last assistant text + usage |
+| `opencode_status` | `sessionID` | busy/idle, last text tail, error info |
+| `opencode_result` | `sessionID` | final assistant text, model, usage |
+| `opencode_interrupt` | `sessionID`, `continue?` | stop current run |
+| `opencode_list` | — | sessions started via this MCP (registry in `ctx.storage`) |
+
+Defaults: async preferred (start → poll/wait) to avoid Codex MCP call timeouts.
+Idle detection: `ctx.session.wait` primary; event subscription / polling fallback.
+
+## Permissions (unattended runs stall on permission prompts)
+
+Decide in M1: dedicated agent via `ctx.agent.transform` vs session-scoped
+`ctx.permission.rules`. Policy mirrors the user's global config: allow edit/bash in
+project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
+
+## Security / ops
+
+- Bind `127.0.0.1` only. Optional static token (plugin option → Codex
+  `--bearer-token-env-var`).
+- Port default `4787`, plugin option. EADDRINUSE → health-probe; skip quietly if ours.
+- Rendezvous file `~/.config/opencode/codex-mcp.json` `{url, port, pid}` written on
+  start, removed on stop.
+- Logs: `console.error` prefixed `[codex-mcp]`, visible with `--print-logs`.
+
+## Milestones
+
+0. **Spike (this step)**: repo + skeleton; plugin loads; Bun.serve binds; MCP
+   handshake passes via SDK client; Codex registration accepted.
+1. Core tools + storage registry + idle tracking.
+2. Agent/permission policy + per-call directory targeting + model validation.
+3. Tests (bun test, co-located; M0-style end-to-end run), README, global install.
+
+## Risks
+
+- Codex MCP (rmcp) vs stateless transport quirks → SDK + M0 kill-gate before tool work.
+- Plugin npm dependency resolution from a global config dir → fallback: hand-rolled
+  JSON-RPC (~150 LOC).
+- `ctx.session.wait` / status semantics on 2.0.15 → event sub + poll fallback.
+- Legacy vs V2 plugin config shape on the installed opencode → verified per load path.
