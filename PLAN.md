@@ -74,10 +74,33 @@ project; never auto-allow `git push`, `git clone`, `rm -rf`, `curl -o`, `DROP`.
   start, removed on stop.
 - Logs: `console.error` prefixed `[codex-mcp]`, visible with `--print-logs`.
 
+## M0 spike results (done)
+
+- Plugin loads from `.opencode/plugins/codex-mcp/index.ts` (dir + index.ts, no
+  package.json needed) — state `active` per `GET /api/plugin`.
+- Locations build lazily: on a fresh server the plugin activates once the location is
+  built (`POST /api/location/reload` forces it). In production the global `plugins`
+  config means every location loads it, so the endpoint is up whenever the service runs.
+- `Bun.serve` + `WebStandardStreamableHTTPServerTransport` (stateless,
+  `enableJsonResponse`) works; SDK client test (`bun test`) passes: initialize,
+  tools/list, tools/call.
+- `codex mcp add opencode-impl --url http://127.0.0.1:4787/mcp` + `codex mcp list`
+  (Status enabled) verified.
+- E2E: `codex exec` discovered `opencode-impl/opencode_ping` and called it. First
+  attempt blocked: "MCP tool call requires approval, but approval policy is never";
+  fixed with `default_tools_approval_mode = "approve"` on the server entry in
+  `~/.codex/config.toml`. Needed for the real workflow.
+- Side-finding: the global slugineer plugin fails to load under opencode 2.0.15
+  (config `plugin` entry is treated as an npm package target). Pre-existing; separate fix.
+
+Global install path (M1, verify): `"plugins": [{ "package":
+"/Users/connorfranc/dev/opencode-codex-mcp/src/plugin.ts", "options": { "port": 4787 } }]`
+in `~/.config/opencode/opencode.jsonc` (absolute file target accepted per docs).
+Requires an OpenCode service restart, which ends the current TUI session — user action.
+
 ## Milestones
 
-0. **Spike (this step)**: repo + skeleton; plugin loads; Bun.serve binds; MCP
-   handshake passes via SDK client; Codex registration accepted.
+0. **Spike** — done, see above.
 1. Core tools + storage registry + idle tracking.
 2. Agent/permission policy + per-call directory targeting + model validation.
 3. Tests (bun test, co-located; M0-style end-to-end run), README, global install.

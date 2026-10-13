@@ -23,6 +23,19 @@ codex mcp add opencode-impl --url http://127.0.0.1:4787/mcp
 codex mcp list
 ```
 
+Codex blocks MCP tool calls under restrictive approval policies; add this to the
+`[mcp_servers.opencode-impl]` section in `~/.codex/config.toml`:
+
+```toml
+default_tools_approval_mode = "approve"
+```
+
+## M0 status
+
+Verified end-to-end: plugin loads, MCP endpoint binds, SDK client handshake test
+passes, Codex discovers and calls `opencode_ping`. Local machine only (loopback
+bind, no token). Session tools land in M1.
+
 ## Layout
 
 - `src/plugin.ts` — OpenCode plugin entry (`Plugin.define`), binds the MCP server.
