@@ -3,6 +3,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { DEFAULT_PORT, startMcpServer, type McpServerHandle } from "./mcp"
+import type { Ctx } from "./tools"
 
 const LOG = "[codex-mcp]"
 
@@ -15,13 +16,20 @@ function configDir(): string {
 export default Plugin.define({
   id: "codex-mcp",
   setup(ctx) {
-    const port = DEFAULT_PORT
+    const port =
+      typeof ctx.options?.port === "number" && Number.isInteger(ctx.options.port)
+        ? (ctx.options.port as number)
+        : DEFAULT_PORT
     const directory = ctx.location?.directory ?? "?"
     console.error(`${LOG} setup in ${directory}`)
 
     let server: McpServerHandle
     try {
-      server = startMcpServer({ port })
+      server = startMcpServer({
+        port,
+        ctx: ctx as unknown as Ctx,
+        pluginOptions: (ctx.options ?? {}) as Record<string, unknown>,
+      })
     } catch (error) {
       console.error(`${LOG} bind on ${port} failed (another instance?):`, error)
       return

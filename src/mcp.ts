@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
+import { registerCodexTools, type Ctx } from "./tools"
 
 export const DEFAULT_PORT = 4787
 
@@ -8,8 +9,15 @@ export interface McpServerHandle {
   stop(): void
 }
 
-function buildServer(): McpServer {
-  const server = new McpServer({ name: "opencode-codex-mcp", version: "0.1.0" })
+export interface StartOptions {
+  port?: number
+  hostname?: string
+  ctx?: Ctx
+  pluginOptions?: Record<string, unknown>
+}
+
+function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown>): McpServer {
+  const server = new McpServer({ name: "opencode-codex-mcp", version: "0.2.0" })
 
   server.registerTool(
     "opencode_ping",
@@ -22,12 +30,19 @@ function buildServer(): McpServer {
     }),
   )
 
+  if (ctx) {
+    const configured =
+      typeof pluginOptions.defaultWaitMs === "number" ? (pluginOptions.defaultWaitMs as number) : undefined
+    registerCodexTools(server, ctx, { defaultWaitMs: configured })
+  }
+
   return server
 }
 
-export function startMcpServer(options: { port?: number; hostname?: string } = {}): McpServerHandle {
+export function startMcpServer(options: StartOptions = {}): McpServerHandle {
   const port = options.port ?? DEFAULT_PORT
   const hostname = options.hostname ?? "127.0.0.1"
+  const pluginOptions = options.pluginOptions ?? {}
 
   const httpServer = Bun.serve({
     hostname,
@@ -38,7 +53,7 @@ export function startMcpServer(options: { port?: number; hostname?: string } = {
         return new Response("not found", { status: 404 })
       }
       // Stateless mode: fresh server + transport per request.
-      const server = buildServer()
+      const server = buildServer(options.ctx, pluginOptions)
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
