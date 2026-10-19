@@ -3,7 +3,8 @@
 MCP bridge that lets Codex start and drive OpenCode implementation sessions running
 `opencode-go/deepseek-v4.1-flash`. Local machine only: the endpoint binds `127.0.0.1`.
 
-Global loading and a live model session verified on OpenCode 2.0.15.
+Global plugin loading is exercised against the installed OpenCode 2.0.28 package; the live
+model session was last verified on OpenCode 2.0.15.
 
 ## Tools
 
@@ -84,6 +85,42 @@ Recorded honestly; no upstream capability is assumed that was not observed:
 - **No paid/live provider run** was performed for this change; live session tests remain gated
   behind `RUN_LIVE=1`.
 
+## Endpoint lifetime and reacquisition
+
+OpenCode 2.0.28 has **no service-lifetime plugin hook**. Plugins are location-scoped
+(`PluginSupervisor.makeLocationNode` in the installed `packages/core/src/plugin/supervisor.ts`),
+and an idle location's plugin graph is disposed after ~60 minutes. Gangway therefore makes the
+MCP listener process-lifetime:
+
+- The first location acquires the listener, writes `endpoint.json`, and owns the endpoint for the
+  life of the OpenCode host process. Additional locations attach as leases.
+- When a location unloads (UI close or idle eviction), only its lease is released. If it was the
+  final lease, the listener and rendezvous still stay up.
+- Each tool-call MCP request resolves context independently: a live instance whose location
+  directory canonicalizes to the requested directory, else the first live instance. If no live
+  instance remains, it uses the requested directory (from `opencode_start_session.directory`) or
+  the most recently known directory, verifies that it still exists and is a directory, then asks
+  the OpenCode service to boot it through `GET /api/location?location%5Bdirectory%5D=...` before
+  retrying live-instance selection. Ping, initialize, and `tools/list` stay context-free and do
+  not wake an idle location.
+- Reacquisition reads `$XDG_STATE_HOME/opencode/service.json` (default
+  `~/.local/state/opencode/service.json`) and requires its `pid` to equal the current process. The
+  request uses Basic auth (`opencode` / the file's `password`) with a 5 s timeout. The password is
+  never logged. If the file is missing or belongs to another process, reacquisition fails with a
+  descriptive error instead of guessing a port.
+- A deleted or missing directory is never booted, and a live instance whose directory disappeared
+  is not reused. Requests targeting a deleted worktree are rejected.
+- Intentional process shutdown (`exit`/`beforeExit`) stops every listener, removes its rendezvous
+  file, and clears the in-process endpoint state. `shutdownEndpoints()` is exported and idempotent
+  for tests/tools. SIGINT/SIGTERM handlers are intentionally not installed; the OpenCode host owns
+  those signals. SIGKILL cannot run cleanup, so a stale `endpoint.json` can remain until the next
+  startup overwrites it (the file is rewritten on the next acquire).
+
+The rendezvous file lives at `~/.local/state/gangway/endpoint.json`
+(`$XDG_STATE_HOME/gangway/endpoint.json` when configured). It must stay outside OpenCode's watched
+configuration directories: writing it there can trigger repeated configuration reloads and block
+prompt admission.
+
 ## Dev
 
 ```sh
@@ -96,23 +133,34 @@ opencode serve --port 4111 --print-logs
 ### Test commands and outcomes
 
 ```sh
+# Deterministic offline lifecycle: eviction, reacquisition, reload, shutdown:
+bun test test/lifecycle.test.ts    # 6 pass, 0 fail
+
+# Per-request context resolution (lazy facade + resolver failure + body parsing):
+bun test test/server.test.ts       # 4 pass, 0 fail
+
+# Package directory resolution:
+bun test test/plugin.test.ts       # 1 pass, 0 fail
+
 # Focused offline fake-context suite for requestID dispatch/resume (no network/provider):
 bun test test/dispatch.test.ts     # 15 pass, 0 fail
 
 # Endpoint suite (static cases; live cases skip unless RUN_LIVE=1):
-bun test test/mcp.test.ts          # 3 pass, 3 skip, 0 fail
+bun test test/mcp.test.ts          # 3 pass, 3 skip, 0 fail when a local endpoint answers;
+                                   # 6 skip when none does
 
 # Everything:
-bun test                           # 22 pass, 3 skip, 0 fail
+bun test                           # 29 pass, 3 skip, 0 fail (with a local endpoint answering)
 
-# Type check (pre-existing environment-type errors only, unchanged by this change):
+# Type check (pre-existing environment-type errors only):
 bunx tsc --noEmit                  # exit 2: missing @types/node and @types/bun
 ```
 
-`bunx tsc --noEmit` reports `.ts` errors for `node:*`/`process`/`Bun`/`bun:test` in every source
+`bunx tsc --noEmit` reports errors for `node:*`/`process`/`Buffer`/`Bun`/`bun:test` in every source
 and test file because the dev dependencies omit `@types/node` and `@types/bun` (`types: []` in
-`tsconfig.json`). The count and content are identical to the pre-change baseline; `src/tools.ts`
-itself reports no type errors. Run the live suite with `RUN_LIVE=1 bun test`.
+`tsconfig.json`). Comparing against a pristine `HEAD` archive shows the same diagnostic classes;
+this change only adds more of them (new Bun/Node-using code) and removes an old test-helper `Ctx`
+mismatch. No dependencies were added. Run the live suite with `RUN_LIVE=1 bun test`.
 
 ## Codex setup
 
@@ -150,22 +198,20 @@ The root `index.ts` exports the plugin for directory loading.
 Reload the project location or restart the OpenCode service to activate it (a restart
 ends any open TUI session). Multiple locations share `127.0.0.1:4787` through
 process-wide leases. When one location unloads, a remaining location takes over
-request handling; the final unload closes the endpoint. An external port collision
-is reported as a plugin failure.
-
-The rendezvous file lives at `~/.local/state/gangway/endpoint.json`
-(`$XDG_STATE_HOME/gangway/endpoint.json` when configured). It must stay outside
-OpenCode's watched configuration directories: writing it there can trigger repeated
-configuration reloads and block prompt admission.
+request handling; the final unload keeps the listener alive for the host process so
+a later request can reacquire a location (see “Endpoint lifetime and reacquisition”
+above). An external port collision is reported as a plugin failure.
 
 ## Layout
 
-- `src/plugin.ts` — plugin entry (`Plugin.define`), binds the MCP server, rendezvous file.
+- `src/plugin.ts` — plugin entry (`Plugin.define`); registers each location as an endpoint lease.
 - `index.ts` — package directory entry point for the global OpenCode loader.
-- `src/mcp.ts` — MCP server (streamable HTTP, stateless) + tool registration.
-- `src/lifecycle.ts` — shared endpoint leases and ownership transfer.
+- `src/mcp.ts` — MCP server (streamable HTTP, stateless), per-request context resolution + tools.
+- `src/lifecycle.ts` — process-lifetime endpoint ownership, lease handover, HTTP reacquisition,
+  shutdown cleanup and rendezvous file.
 - `src/tools.ts` — session tools, permission ruleset, wait/result logic.
 - `test/mcp.test.ts` — endpoint suite + `RUN_LIVE` session suite.
 - `test/dispatch.test.ts` — offline fake-context dispatch/resume suite (requestID).
-- `test/server.test.ts` — port collision / lifecycle.
+- `test/lifecycle.test.ts` — deterministic eviction/reacquisition/reload/shutdown suite.
+- `test/server.test.ts` — port collision, per-request resolution/lazy context facade.
 - `test/plugin.test.ts` — package directory resolution and import.
