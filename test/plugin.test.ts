@@ -10,3 +10,9 @@ test("OpenCode resolves and loads the configured package directory", async () =>
   expect(module.default.id).toBe("gangway")
   expect(typeof module.default.setup).toBe("function")
 })
+
+test("OpenCode resolves the TUI entrypoint", () => {
+  const directory = fileURLToPath(new URL("../", import.meta.url))
+  const entrypoints = Host.resolve({ directory })
+  expect(entrypoints.tui).toBe(new URL("../tui.ts", import.meta.url).href)
+})

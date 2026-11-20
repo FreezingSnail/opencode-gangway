@@ -5,6 +5,10 @@
   "private": true,
   "type": "module",
   "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./src/tui.tsx"
+  },
   "scripts": {
     "test": "bun test"
   },

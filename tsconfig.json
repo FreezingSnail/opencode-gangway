@@ -8,6 +8,8 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "types": []
   },
   "include": ["src", "test", ".opencode"]

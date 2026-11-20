@@ -121,6 +121,32 @@ The rendezvous file lives at `~/.local/state/gangway/endpoint.json`
 configuration directories: writing it there can trigger repeated configuration reloads and block
 prompt admission.
 
+## TUI panel
+
+Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions panel:
+
+- **Open with `ctrl+x d`** (`<leader>d`, configurable as `gangway.sessions` in keybinds), the
+  command palette ("Gangway sessions"), or the `/gangway` slash command.
+- Lists gangway sessions: `[codex]`/`codexMcp`-marked roots only, newest first, with model, age,
+  directory and a live busy indicator.
+- **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — active sessions in
+  the current directory (default), `active` — active sessions in every directory, `all` —
+  every gangway session. Active = busy or updated within the last hour. The filter persists
+  across panel opens (plugin storage). Tab labels show live counts.
+- **Updates live** — new sessions, titles, and busy/idle state are projected from server events
+  through the shared data store, no manual refresh. Historical sessions from other directories
+  are hydrated at startup and on a 5 s fallback sweep; the page also handles `r`.
+- `enter` opens the session, `i` interrupts it, `j`/`k` move selection, `esc` returns.
+- The home footer shows a `gangway N` counter, and a toast announces each new Codex-started
+  session (with an Open action).
+
+Sessions are recognized by `metadata.codexMcp` with a `[codex]` title-prefix fallback so
+pre-metadata history stays visible (`src/tui-helpers.ts`). The TUI entry re-exports from the
+root `tui.ts` for directory loading and is declared as `./tui` in `package.json` `exports`.
+JSX types (`solid-js`, `@opentui/*`) resolve from the OpenCode host at runtime; they are not
+dev dependencies, so `tsc` reports them as missing — install
+`solid-js @opentui/core @opentui/solid` as dev dependencies if a green typecheck matters.
+
 ## Dev
 
 ```sh
@@ -140,7 +166,10 @@ bun test test/lifecycle.test.ts    # 6 pass, 0 fail
 bun test test/server.test.ts       # 4 pass, 0 fail
 
 # Package directory resolution:
-bun test test/plugin.test.ts       # 1 pass, 0 fail
+bun test test/plugin.test.ts       # 2 pass, 0 fail
+
+# TUI panel helpers (session marker/title/age/filter/truncation):
+bun test test/tui-helpers.test.ts  # 9 pass, 0 fail
 
 # Focused offline fake-context suite for requestID dispatch/resume (no network/provider):
 bun test test/dispatch.test.ts     # 15 pass, 0 fail
@@ -150,7 +179,7 @@ bun test test/mcp.test.ts          # 3 pass, 3 skip, 0 fail when a local endpoin
                                    # 6 skip when none does
 
 # Everything:
-bun test                           # 29 pass, 3 skip, 0 fail (with a local endpoint answering)
+bun test                           # 39 pass, 3 skip, 0 fail (with a local endpoint answering)
 
 # Type check (pre-existing environment-type errors only):
 bunx tsc --noEmit                  # exit 2: missing @types/node and @types/bun
@@ -158,9 +187,11 @@ bunx tsc --noEmit                  # exit 2: missing @types/node and @types/bun
 
 `bunx tsc --noEmit` reports errors for `node:*`/`process`/`Buffer`/`Bun`/`bun:test` in every source
 and test file because the dev dependencies omit `@types/node` and `@types/bun` (`types: []` in
-`tsconfig.json`). Comparing against a pristine `HEAD` archive shows the same diagnostic classes;
-this change only adds more of them (new Bun/Node-using code) and removes an old test-helper `Ctx`
-mismatch. No dependencies were added. Run the live suite with `RUN_LIVE=1 bun test`.
+`tsconfig.json`), and `src/tui.tsx` additionally cannot resolve `solid-js`/`@opentui/*` types
+(the OpenCode host supplies those at runtime). Comparing against a pristine `HEAD` archive shows
+the same diagnostic classes for the pre-existing code; this change only adds more of them (new
+Bun/Node-using code and the TUI panel) and removes an old test-helper `Ctx` mismatch. No
+dependencies were added. Run the live suite with `RUN_LIVE=1 bun test`.
 
 ## Codex setup
 
@@ -206,6 +237,8 @@ above). An external port collision is reported as a plugin failure.
 
 - `src/plugin.ts` — plugin entry (`Plugin.define`); registers each location as an endpoint lease.
 - `index.ts` — package directory entry point for the global OpenCode loader.
+- `tui.ts` — TUI entry re-export; `src/tui.tsx` renders the live gangway sessions panel
+  (route + keymap + slots), `src/tui-helpers.ts` holds the pure session filters/labels.
 - `src/mcp.ts` — MCP server (streamable HTTP, stateless), per-request context resolution + tools.
 - `src/lifecycle.ts` — process-lifetime endpoint ownership, lease handover, HTTP reacquisition,
   shutdown cleanup and rendezvous file.
