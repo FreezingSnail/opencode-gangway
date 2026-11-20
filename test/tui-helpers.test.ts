@@ -59,15 +59,9 @@ test("formatAge buckets by age", () => {
   expect(formatAge(old.getTime(), now)).toBe(`${old.getMonth() + 1}/${old.getDate()}`)
 })
 
-test("isActiveSession treats running and recently-updated sessions as active", () => {
-  const now = 1_000_000_000
-  const freshIdle = makeSession({ time: { created: now - 120_000, updated: now - 30_000 } })
-  expect(isActiveSession(freshIdle, "idle", now)).toBe(true)
-  expect(isActiveSession(makeSession({ time: { created: now, updated: now - 2 * 3_600_000 } }), "idle", now)).toBe(
-    false,
-  )
-  const staleRunning = makeSession({ time: { created: now, updated: now - 2 * 3_600_000 } })
-  expect(isActiveSession(staleRunning, "running", now)).toBe(true)
+test("isActiveSession counts only busy sessions as active", () => {
+  expect(isActiveSession("running")).toBe(true)
+  expect(isActiveSession("idle")).toBe(false)
 })
 
 test("truncateHead and truncatePath keep content within bounds", () => {
@@ -77,24 +71,25 @@ test("truncateHead and truncatePath keep content within bounds", () => {
   expect(truncatePath("/Users/me/dev/a/very/long/path/name", 16)).toBe("…/long/path/name")
 })
 
-test("applyGangwayFilter partitions by activity and directory", () => {
+test("applyGangwayFilter evicts completed sessions from active views", () => {
   const now = 1_000_000_000
   const status: Record<string, "idle" | "running"> = {}
-  const mk = (id: string, directory: string, updated: number): SessionInfo => {
-    status[id] = "idle"
-    return makeSession({ id, location: { directory }, time: { created: updated, updated } })
+  const mk = (id: string, directory: string, running: boolean): SessionInfo => {
+    status[id] = running ? "running" : "idle"
+    return makeSession({ id, location: { directory }, time: { created: now, updated: now } })
   }
-  const inDir = mk("a", "/work/foo", now - 60_000)
-  const otherDir = mk("b", "/work/bar", now - 60_000)
-  const stale = mk("c", "/work/foo", now - 2 * 3_600_000)
-  const sessions = [inDir, otherDir, stale]
+  const busyHere = mk("a", "/work/foo", true)
+  const doneFresh = mk("b", "/work/foo", false)
+  const doneStale = mk("c", "/work/foo", false)
+  const busyElsewhere = mk("d", "/work/bar", true)
+  const sessions = [busyHere, doneFresh, doneStale, busyElsewhere]
 
-  const options = { directory: "/work/foo", now, status: (s: SessionInfo) => status[s.id]! }
-  expect(applyGangwayFilter(sessions, "all", options).map((s) => s.id)).toEqual(["a", "b", "c"])
-  expect(applyGangwayFilter(sessions, "active", options).map((s) => s.id)).toEqual(["a", "b"])
+  const options = { directory: "/work/foo", status: (s: SessionInfo) => status[s.id]! }
+  expect(applyGangwayFilter(sessions, "all", options).map((s) => s.id)).toEqual(["a", "b", "c", "d"])
+  expect(applyGangwayFilter(sessions, "active", options).map((s) => s.id)).toEqual(["a", "d"])
   expect(applyGangwayFilter(sessions, "here", options).map((s) => s.id)).toEqual(["a"])
   expect(applyGangwayFilter(sessions, "here", { ...options, directory: undefined }).map((s) => s.id)).toEqual([
     "a",
-    "b",
+    "d",
   ])
 })

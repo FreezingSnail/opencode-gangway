@@ -129,9 +129,10 @@ Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions p
   command palette ("Gangway sessions"), or the `/gangway` slash command.
 - Lists gangway sessions: `[codex]`/`codexMcp`-marked roots only, newest first, with model, age,
   directory and a live busy indicator.
-- **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — active sessions in
-  the current directory (default), `active` — active sessions in every directory, `all` —
-  every gangway session. Active = busy or updated within the last hour. The filter persists
+- **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — busy sessions in
+  the current directory (default), `active` — busy sessions in every directory, `all` —
+  every gangway session. Completed sessions leave the active views as soon as they go idle;
+  `all` keeps the history. The filter persists
   across panel opens (plugin storage). Tab labels show live counts.
 - **Updates live** — new sessions, titles, and busy/idle state are projected from server events
   through the shared data store, no manual refresh. Historical sessions from other directories

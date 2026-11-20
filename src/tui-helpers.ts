@@ -36,15 +36,12 @@ export type GangwayFilter = "here" | "active" | "all"
 
 export const GANGWAY_FILTERS: readonly GangwayFilter[] = ["here", "active", "all"]
 
-/** A session counts as active while busy or shortly after its last update. */
-export const ACTIVE_WINDOW_MS = 60 * 60_000
-
-export function isActiveSession(
-  session: SessionInfo,
-  status: "idle" | "running",
-  now: number = Date.now(),
-): boolean {
-  return status === "running" || now - session.time.updated <= ACTIVE_WINDOW_MS
+/**
+ * A session counts as active only while it is busy. Completed sessions are
+ * evicted from the active views immediately; they stay reachable in "all".
+ */
+export function isActiveSession(status: "idle" | "running"): boolean {
+  return status === "running"
 }
 
 export type SessionStatus = (session: SessionInfo) => "idle" | "running"
@@ -52,10 +49,9 @@ export type SessionStatus = (session: SessionInfo) => "idle" | "running"
 export function applyGangwayFilter(
   sessions: readonly SessionInfo[],
   filter: GangwayFilter,
-  options: { readonly directory?: string; readonly status: SessionStatus; readonly now?: number },
+  options: { readonly directory?: string; readonly status: SessionStatus },
 ): SessionInfo[] {
-  const now = options.now ?? Date.now()
-  const active = sessions.filter((session) => isActiveSession(session, options.status(session), now))
+  const active = sessions.filter((session) => isActiveSession(options.status(session)))
   if (filter === "active") return active
   if (filter === "here") {
     const directory = options.directory
