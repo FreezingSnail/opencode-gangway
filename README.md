@@ -169,9 +169,10 @@ prompt admission.
 Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions panel:
 
 - **Open with `ctrl+x d`** (`<leader>d`, configurable as `gangway.sessions` in keybinds), the
-  command palette ("Gangway sessions"), the `/gangway` slash command, or — on a session screen
-  with an empty prompt — `left`/`shift+left`. With text in the prompt those keys keep their
-  normal cursor-move/selection behavior, and dialogs, autocomplete and form modes are unaffected.
+  command palette ("Gangway sessions"), the `/gangway` slash command, or — on the blank new-chat
+  page or any session screen with an empty prompt — `left`/`shift+left`. With text in the prompt
+  those keys keep their normal cursor-move/selection behavior, and dialogs, autocomplete and
+  form modes are unaffected.
 - Lists gangway sessions: `[gangway]`/`metadata.gangway`-marked roots (plus legacy
   `[codex]`/`codexMcp` sessions) only, newest first, with model, age, directory and a live state
   indicator. The glyph is `!` for a pending permission request, `?` for a pending question

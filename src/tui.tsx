@@ -392,13 +392,14 @@ export default Plugin.define({
             },
           ],
         }))
-        // Empty-prompt gesture. Base mode keeps it out of dialogs, autocomplete
-        // and form modes; priority 2 beats the prompt layers (1) and the managed
-        // textarea bindings. A non-empty prompt returns false so the event
-        // continues to the cursor/selection bindings untouched. Read the route
-        // in the factory body so navigation refreshes the layer; never attach a
-        // one-shot `target` accessor, which can be captured before the prompt
-        // editor exists.
+        // Empty-prompt gesture from the blank new-chat page or any session.
+        // Base mode keeps it out of dialogs, autocomplete and form modes;
+        // priority 2 beats the prompt layers (1) and the managed textarea
+        // bindings. A non-empty prompt returns false so the event continues to
+        // the cursor/selection bindings untouched. Read the route in the factory
+        // body so navigation refreshes the layer; never attach a one-shot
+        // `target` accessor, which can be captured before the prompt editor
+        // exists.
         const openOnEmptyLeft = () => {
           const allowed = shouldOpenPanelOnLeft({
             routeType: context.ui.router.current().type,
@@ -413,7 +414,7 @@ export default Plugin.define({
           return {
             mode: "base",
             priority: 2,
-            enabled: routeType === "session",
+            enabled: routeType === "session" || routeType === "home",
             commands: [
               { bind: "left", title: "Gangway sessions", group: "Gangway", run: openOnEmptyLeft },
               { bind: "shift+left", title: "Gangway sessions", group: "Gangway", run: openOnEmptyLeft },

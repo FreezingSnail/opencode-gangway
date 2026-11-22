@@ -125,10 +125,11 @@ test("sessionGlyph prioritizes attention over busy/idle", () => {
   expect(sessionGlyph("idle", { kind: "question" })).toBe("?")
 })
 
-test("shouldOpenPanelOnLeft requires a session route, base mode and an empty prompt", () => {
+test("shouldOpenPanelOnLeft accepts home or session routes with an empty prompt in base mode", () => {
   expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "base", editorText: "" })).toBe(true)
-  expect(shouldOpenPanelOnLeft({ routeType: "home", mode: "base", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "home", mode: "base", editorText: "" })).toBe(true)
   expect(shouldOpenPanelOnLeft({ routeType: "plugin", mode: "base", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "home", mode: "autocomplete", editorText: "" })).toBe(false)
   expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "autocomplete", editorText: "" })).toBe(false)
   expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "form", editorText: "" })).toBe(false)
   expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "base", editorText: "hello" })).toBe(false)
