@@ -1,14 +1,32 @@
 import type { SessionInfo } from "@opencode/client"
 
-export const TITLE_TAG = "[codex]"
+export const TITLE_TAG = "[gangway]"
+/** Prefix written by bridge versions before the neutral markers landed. */
+export const LEGACY_TITLE_TAG = "[codex]"
+
+export interface GangwayMarkerInput {
+  metadata?: Record<string, unknown> | null
+  title?: string | null
+}
 
 /**
  * True for sessions started (or attached to) by the gangway MCP bridge.
- * New sessions carry `metadata.codexMcp`; older ones only have the
- * `[codex]` title prefix. Both markers are checked so history stays visible.
+ * New sessions carry `metadata.gangway` and a `[gangway]` title prefix.
+ * Sessions from older bridge versions carry `metadata.codexMcp` and/or a
+ * `[codex]` title prefix; both legacy markers are accepted so history stays
+ * visible in the panel.
  */
+export function hasGangwayMarker(session: GangwayMarkerInput): boolean {
+  return (
+    session.metadata?.gangway === true ||
+    session.metadata?.codexMcp === true ||
+    session.title?.startsWith(TITLE_TAG) === true ||
+    session.title?.startsWith(LEGACY_TITLE_TAG) === true
+  )
+}
+
 export function isGangwaySession(session: SessionInfo): boolean {
-  return session.metadata?.codexMcp === true || session.title?.startsWith(TITLE_TAG) === true
+  return hasGangwayMarker(session)
 }
 
 export function titleLabel(session: SessionInfo): string {

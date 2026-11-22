@@ -266,7 +266,7 @@ export function acquireEndpoint(options: AcquireEndpointOptions): () => void {
     released = true
     owned.instances.delete(token)
     // Process-lifetime ownership: the endpoint stays up after the final lease
-    // releases so an idle host can still serve new Codex requests.
+    // releases so an idle host can still serve new bridge requests.
   }
 }
 

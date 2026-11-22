@@ -5,6 +5,7 @@ import {
   GANGWAY_FILTERS,
   applyGangwayFilter,
   formatAge,
+  hasGangwayMarker,
   isGangwaySession,
   modelLabel,
   titleLabel,
@@ -230,7 +231,7 @@ function EmptyState(props: { context: Plugin.Context; filter: () => GangwayFilte
   const theme = props.context.theme
   const message = createMemo(() => {
     const filter = props.filter()
-    if (filter === "all") return "No gangway sessions yet. They appear live when Codex starts one."
+    if (filter === "all") return "No gangway sessions yet. They appear live when a client starts one."
     if (filter === "active") return "No active gangway sessions right now."
     return `No active gangway sessions in ${props.context.ui.format.path(props.directory ?? "?")}.`
   })
@@ -307,10 +308,10 @@ export default Plugin.define({
     })
 
     const stopCreated = context.data.on("session.created", (event) => {
-      if (event.data.metadata?.codexMcp !== true) return
+      if (!hasGangwayMarker(event.data)) return
       context.ui.toast.show({
         sessionID: event.data.sessionID,
-        message: "Codex started a gangway session",
+        message: "Gangway session started",
         variant: "info",
       })
     })

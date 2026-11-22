@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import {
   applyGangwayFilter,
   formatAge,
+  hasGangwayMarker,
   isActiveSession,
   isGangwaySession,
   modelLabel,
@@ -23,17 +24,37 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   }
 }
 
-test("isGangwaySession matches metadata marker", () => {
+test("isGangwaySession matches the neutral metadata marker", () => {
+  expect(isGangwaySession(makeSession({ metadata: { gangway: true } }))).toBe(true)
+})
+
+test("isGangwaySession matches the legacy metadata marker", () => {
   expect(isGangwaySession(makeSession({ metadata: { codexMcp: true } }))).toBe(true)
 })
 
-test("isGangwaySession matches legacy title prefix", () => {
+test("isGangwaySession matches the neutral title prefix", () => {
+  expect(isGangwaySession(makeSession({ title: "[gangway] fix the build" }))).toBe(true)
+})
+
+test("isGangwaySession matches the legacy title prefix", () => {
   expect(isGangwaySession(makeSession({ title: "[codex] fix the build" }))).toBe(true)
 })
 
-test("isGangwaySession rejects ordinary sessions", () => {
+test("isGangwaySession ignores marker-like values and partial prefixes", () => {
+  expect(isGangwaySession(makeSession({ metadata: { gangway: false } }))).toBe(false)
+  expect(isGangwaySession(makeSession({ metadata: { codexMcp: "true" } }))).toBe(false)
+  expect(isGangwaySession(makeSession({ title: "prefix [gangway] fix" }))).toBe(false)
+  expect(isGangwaySession(makeSession({ title: "[codexish] fix" }))).toBe(false)
   expect(isGangwaySession(makeSession({ title: "my session" }))).toBe(false)
   expect(isGangwaySession(makeSession({}))).toBe(false)
+})
+
+test("hasGangwayMarker accepts event-shaped data without extra fields", () => {
+  expect(hasGangwayMarker({ metadata: { gangway: true } })).toBe(true)
+  expect(hasGangwayMarker({ metadata: { codexMcp: true } })).toBe(true)
+  expect(hasGangwayMarker({ title: "[gangway] task" })).toBe(true)
+  expect(hasGangwayMarker({ title: "[codex] task" })).toBe(true)
+  expect(hasGangwayMarker({})).toBe(false)
 })
 
 test("titleLabel falls back for untitled sessions", () => {

@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
-import { registerCodexTools, type Ctx } from "./tools"
+import { registerBridgeTools, type Ctx } from "./tools"
 
 export const DEFAULT_PORT = 4787
 
@@ -168,9 +168,12 @@ function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown
   if (ctx) {
     const configured =
       typeof pluginOptions.defaultWaitMs === "number" ? (pluginOptions.defaultWaitMs as number) : undefined
-    registerCodexTools(server, ctx, {
+    const titlePrefix =
+      typeof pluginOptions.titlePrefix === "string" ? (pluginOptions.titlePrefix as string) : undefined
+    registerBridgeTools(server, ctx, {
       defaultWaitMs: configured,
       inheritPermissions: pluginOptions.inheritPermissions === true,
+      ...(titlePrefix ? { titlePrefix } : {}),
     })
   }
 

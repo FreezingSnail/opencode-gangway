@@ -1,7 +1,8 @@
 # gangway
 
-MCP bridge that lets Codex start and drive OpenCode implementation sessions running
-`opencode-go/deepseek-v4.1-flash`. Local machine only: the endpoint binds `127.0.0.1`.
+MCP bridge that lets an MCP-capable client (Codex, Claude Code, Goose, Zed, …) start and
+drive OpenCode implementation sessions running `opencode-go/deepseek-v4.1-flash`. Local
+machine only: the endpoint binds `127.0.0.1`.
 
 Global plugin loading is exercised against the installed OpenCode 2.0.28 package; the live
 model session was last verified on OpenCode 2.0.15.
@@ -18,10 +19,11 @@ model session was last verified on OpenCode 2.0.15.
 | `opencode_interrupt` | stop current run |
 | `opencode_list` | sessions started via the bridge |
 
-Sessions get a `[codex]` title prefix and a session-scoped permission ruleset: edit and
-shell allowed, destructive/mirror-denied commands (`git push`, `rm -rf`, `perl*`, …) denied
-so unattended runs cannot stall on approval prompts. `inheritPermissions` plugin option
-restores default behavior.
+Sessions get a `[gangway]` title prefix (override with the `titlePrefix` plugin option) and a
+session-scoped permission ruleset: edit and shell allowed, destructive/mirror-denied commands
+(`git push`, `rm -rf`, `perl*`, …) denied so unattended runs cannot stall on approval prompts.
+`inheritPermissions` plugin option restores default behavior. New sessions also carry
+`metadata.gangway: true` and, with `requestID`, `metadata.gangwayRequestID`.
 
 ## Reliable dispatch and resume
 
@@ -127,8 +129,9 @@ Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions p
 
 - **Open with `ctrl+x d`** (`<leader>d`, configurable as `gangway.sessions` in keybinds), the
   command palette ("Gangway sessions"), or the `/gangway` slash command.
-- Lists gangway sessions: `[codex]`/`codexMcp`-marked roots only, newest first, with model, age,
-  directory and a live busy indicator.
+- Lists gangway sessions: `[gangway]`/`metadata.gangway`-marked roots (plus legacy
+  `[codex]`/`codexMcp` sessions) only, newest first, with model, age, directory and a live busy
+  indicator.
 - **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — busy sessions in
   the current directory (default), `active` — busy sessions in every directory, `all` —
   every gangway session. Completed sessions leave the active views as soon as they go idle;
@@ -138,12 +141,14 @@ Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions p
   through the shared data store, no manual refresh. Historical sessions from other directories
   are hydrated at startup and on a 5 s fallback sweep; the page also handles `r`.
 - `enter` opens the session, `i` interrupts it, `j`/`k` move selection, `esc` returns.
-- The home footer shows a `gangway N` counter, and a toast announces each new Codex-started
-  session (with an Open action).
+- The home footer shows a `gangway N` counter, and a toast announces each new gangway session
+  (with an Open action).
 
-Sessions are recognized by `metadata.codexMcp` with a `[codex]` title-prefix fallback so
-pre-metadata history stays visible (`src/tui-helpers.ts`). The TUI entry re-exports from the
-root `tui.ts` for directory loading and is declared as `./tui` in `package.json` `exports`.
+Sessions are recognized by the neutral `metadata.gangway` marker or `[gangway]` title prefix.
+Legacy sessions from earlier bridge versions are still recognized by `metadata.codexMcp` or the
+`[codex]` title prefix, so pre-change history stays visible (`src/tui-helpers.ts`).
+The TUI entry re-exports from the root `tui.ts` for directory loading and is declared as
+`./tui` in `package.json` `exports`.
 JSX types (`solid-js`, `@opentui/*`) resolve from the OpenCode host at runtime; they are not
 dev dependencies, so `tsc` reports them as missing — install
 `solid-js @opentui/core @opentui/solid` as dev dependencies if a green typecheck matters.
@@ -170,7 +175,7 @@ bun test test/server.test.ts       # 4 pass, 0 fail
 bun test test/plugin.test.ts       # 2 pass, 0 fail
 
 # TUI panel helpers (session marker/title/age/filter/truncation):
-bun test test/tui-helpers.test.ts  # 9 pass, 0 fail
+bun test test/tui-helpers.test.ts  # 12 pass, 0 fail
 
 # Focused offline fake-context suite for requestID dispatch/resume (no network/provider):
 bun test test/dispatch.test.ts     # 15 pass, 0 fail
@@ -180,7 +185,7 @@ bun test test/mcp.test.ts          # 3 pass, 3 skip, 0 fail when a local endpoin
                                    # 6 skip when none does
 
 # Everything:
-bun test                           # 39 pass, 3 skip, 0 fail (with a local endpoint answering)
+bun test                           # 42 pass, 3 skip, 0 fail (with a local endpoint answering)
 
 # Type check (pre-existing environment-type errors only):
 bunx tsc --noEmit                  # exit 2: missing @types/node and @types/bun
@@ -194,7 +199,30 @@ the same diagnostic classes for the pre-existing code; this change only adds mor
 Bun/Node-using code and the TUI panel) and removes an old test-helper `Ctx` mismatch. No
 dependencies were added. Run the live suite with `RUN_LIVE=1 bun test`.
 
-## Codex setup
+## MCP client setup
+
+Any MCP client that supports streamable HTTP can drive the bridge. Register this URL as an MCP
+server:
+
+```
+http://127.0.0.1:4787/mcp
+```
+
+Where the client has an approval policy, allow the gangway tools to run without per-call
+approval prompts — an interactive prompt can stall an unattended session. The bridge does not
+require client-specific metadata; sessions it creates are labeled `[gangway]` and
+`metadata.gangway` regardless of which client called the tools.
+
+Recommended flow for any client:
+
+1. `opencode_start_session` with a stable `requestID`; do not block on the full run.
+2. `opencode_wait` (or `opencode_status`) to resume within the client's request timeout.
+3. `opencode_result` to read the bounded output once the operation completes.
+
+MCP clients time out long tool calls (SDK default 60s), so bridge waits default to 45s and
+return a resumable handle instead of blocking past the client window.
+
+### Codex example
 
 ```sh
 codex mcp add gangway --url http://127.0.0.1:4787/mcp
@@ -206,9 +234,7 @@ Add to `~/.codex/config.toml` under `[mcp_servers.gangway]`:
 default_tools_approval_mode = "approve"
 ```
 
-MCP clients time out long tool calls (SDK default 60s), so bridge waits default to 45s and
-return a resumable handle instead of blocking past the client window. Prefer
-`opencode_start_session` without `wait`, then `opencode_wait` / `opencode_status` — pass a
+Prefer `opencode_start_session` without `wait`, then `opencode_wait` / `opencode_status` — pass a
 `requestID` so a timeout can be resumed rather than retried.
 
 ## Global install

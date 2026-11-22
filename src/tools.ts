@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 
-export const TAG = "[codex]"
+export const TAG = "[gangway]"
 export const DEFAULT_MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
 // A single tool call must finish inside the caller's request window. The MCP SDK
 // default is 60s (`Client` requestTimeout), so the bridge caps its own default
@@ -547,6 +547,7 @@ async function prepareStart(
     model?: { providerID: string; id: string }
   },
   permissions: Array<{ action: string; resource: string; effect: string }> | undefined,
+  titlePrefix: string,
   defaultWaitMs: number,
 ): Promise<DispatchResult> {
   const directory = args.directory ?? ctx.location?.directory ?? null
@@ -580,7 +581,7 @@ async function prepareStart(
     }
 
     if (op.sessionID == null) {
-      const title = `${TAG} ${args.title ?? short(args.prompt)}`
+      const title = `${titlePrefix} ${args.title ?? short(args.prompt)}`
       let created: { id: string }
       try {
         created = await ctx.session.create({
@@ -589,7 +590,7 @@ async function prepareStart(
           ...(args.directory ? { location: { directory: args.directory } } : {}),
           ...(args.agent ? { agent: args.agent } : {}),
           ...(permissions ? { permissions } : {}),
-          metadata: { codexMcp: true, codexRequestID: requestID },
+          metadata: { gangway: true, gangwayRequestID: requestID },
         })
       } catch (error) {
         // Creation outcome uncertain: the session may or may not exist. Keep the
@@ -689,12 +690,13 @@ function statusPayload(op: OperationRecord, info: Record<string, any>) {
   }
 }
 
-export function registerCodexTools(
+export function registerBridgeTools(
   server: McpServer,
   ctx: Ctx,
-  options: { defaultWaitMs?: number; inheritPermissions?: boolean } = {},
+  options: { defaultWaitMs?: number; inheritPermissions?: boolean; titlePrefix?: string } = {},
 ) {
   const defaultWaitMs = options.defaultWaitMs ?? DEFAULT_WAIT_MS
+  const titlePrefix = options.titlePrefix ?? TAG
   const permissions = options.inheritPermissions ? undefined : unattendedRuleset()
 
   server.registerTool(
@@ -705,7 +707,7 @@ export function registerCodexTools(
       inputSchema: {
         prompt: z.string().describe("Implementation task for the OpenCode session"),
         sessionID: z.string().optional().describe("Attach to an existing session instead of creating one"),
-        title: z.string().optional().describe("Session title; gets a [codex] prefix"),
+        title: z.string().optional().describe(`Session title; gets a ${titlePrefix} prefix`),
         directory: z.string().optional().describe("Project directory; defaults to the plugin instance location"),
         agent: z.string().optional().describe("OpenCode agent ID"),
         model: z.string().optional().describe('"provider/modelID"; defaults to opencode-go/deepseek-v4.1-flash'),
@@ -729,14 +731,14 @@ export function registerCodexTools(
           const latest = await lastAssistant(ctx, args.sessionID)
           return reply({ sessionID: args.sessionID, status: idle ? "idle" : "busy", ...latest })
         }
-        const title = `${TAG} ${args.title ?? short(args.prompt)}`
+        const title = `${titlePrefix} ${args.title ?? short(args.prompt)}`
         const created = await ctx.session.create({
           title,
           model,
           ...(args.directory ? { location: { directory: args.directory } } : {}),
           ...(args.agent ? { agent: args.agent } : {}),
           ...(permissions ? { permissions } : {}),
-          metadata: { codexMcp: true },
+          metadata: { gangway: true },
         })
         // Record the mapping before submitting the prompt.
         if (ctx.storage) {
@@ -768,6 +770,7 @@ export function registerCodexTools(
           model: model ?? undefined,
         },
         permissions,
+        titlePrefix,
         defaultWaitMs,
       )
       if (!args.wait) return reply({ ...operationSummary(op), worstCaseWaitMs: defaultWaitMs })
