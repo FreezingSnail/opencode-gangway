@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin/tui"
-import type { SessionInfo } from "@opencode/client"
-import { For, Show, createMemo, createSignal, onMount } from "solid-js"
+import type { LocationRef, PermissionRequest, SessionInfo, SessionMessageInfo } from "@opencode/client"
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import {
   GANGWAY_FILTERS,
   applyGangwayFilter,
@@ -18,12 +18,79 @@ import {
   type GangwayFilter,
   type NeedsInput,
 } from "./tui-helpers"
+import {
+  activeTool,
+  activityAge,
+  assistantExcerpt,
+  latestAction,
+  latestActivityAt,
+  sanitizeTerminalText,
+} from "./tui-preview"
+import { createGangwayStats, STATS_SHORTCUT, type GangwayStatsFeature } from "./tui-stats"
+import { changesKeyCommand, registerChangesView } from "./tui-changes-view"
+import { dispatchKeyCommand, registerDispatchRoute } from "./tui-dispatch-view"
+import { registerTimelineRoute, timelineKeyCommand } from "./tui-timeline-view"
+import { installInbox } from "./tui-inbox"
+import { registerUsageFeature } from "./tui-usage-page"
 
 const PAGE = "gangway.sessions"
 const LIST_LIMIT = 500
 const REFRESH_MS = 5000
 const MODEL_WIDTH = 22
 const PATH_WIDTH = 30
+const WIDE_MIN = 116
+const PREVIEW_WIDTH = 46
+const PREVIEW_HEIGHT = 16
+const AGE_TICK_MS = 15000
+
+interface PreviewApi {
+  list(sessionID: string): SessionMessageInfo[]
+  sync(sessionID: string): Promise<void>
+}
+
+interface PeekSnapshot {
+  readonly id: string
+  readonly title: string
+  readonly directory: string
+  readonly location: LocationRef
+}
+
+interface PeekHistory {
+  readonly id: string
+  readonly status: "loading" | "ready" | "error"
+  readonly error?: string
+  readonly fallback?: boolean
+}
+
+interface FallbackMessages {
+  readonly id: string
+  readonly messages: SessionMessageInfo[]
+}
+
+function terminalWidth(context: Plugin.Context): number {
+  const renderer = context.renderer as unknown as { width?: unknown }
+  if (typeof renderer?.width === "number" && renderer.width > 0) return renderer.width
+  return process.stdout.columns ?? 100
+}
+
+/**
+ * The host's data session owns message caching and event updates. Older hosts
+ * may not expose it; in that case the caller reads the same session directly
+ * with `client.message.list`.
+ */
+function previewApi(context: Plugin.Context): PreviewApi | undefined {
+  const message = (context.data.session as unknown as { message?: Partial<PreviewApi> }).message
+  if (!message || typeof message.list !== "function" || typeof message.sync !== "function") return undefined
+  return message as PreviewApi
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function ageLabel(timestamp: number | undefined, now: number): string {
+  return activityAge(timestamp, now)
+}
 
 // The runtime data store (solid client) exposes `remember`, which hydrates a
 // session from an already-fetched SessionInfo without an extra GET. The TUI
@@ -102,10 +169,18 @@ function SessionsPage(props: {
   filter: () => GangwayFilter
   setFilter: (filter: GangwayFilter) => void
   onBack: () => void
+  stats: GangwayStatsFeature
 }) {
   const context = props.context
   const theme = context.theme
   const [selected, setSelected] = createSignal(0)
+  const [peekID, setPeekID] = createSignal<string>()
+  const [peekSnapshot, setPeekSnapshot] = createSignal<PeekSnapshot>()
+  const [peekHistory, setPeekHistory] = createSignal<PeekHistory>()
+  const [fallbackMessages, setFallbackMessages] = createSignal<FallbackMessages>()
+  const [now, setNow] = createSignal(Date.now())
+  const [width, setWidth] = createSignal(terminalWidth(context))
+  let previewRequest = 0
 
   // Current TUI location: the directory the "here" filter is scoped to.
   const directory = createMemo(() => context.location?.directory ?? context.data.location.default().directory)
@@ -142,6 +217,155 @@ function SessionsPage(props: {
   const waiting = createMemo(() => countWaitingSessions(visible(), attentionOf))
   const selectedIndex = createMemo(() => Math.min(selected(), Math.max(0, visible().length - 1)))
 
+  const wide = () => width() >= WIDE_MIN
+
+  // The peek is pinned to the ID captured at open time. It resolves that ID
+  // through the shared store on every update, so reorders and status changes
+  // never substitute a different session.
+  const peekSession = createMemo(() => {
+    const id = peekID()
+    return id ? context.data.session.get(id) : undefined
+  })
+  const peekMessages = createMemo(() => {
+    const id = peekID()
+    if (!id) return [] as SessionMessageInfo[]
+    const api = previewApi(context)
+    if (api) return api.list(id)
+    const fallback = fallbackMessages()
+    return fallback?.id === id ? fallback.messages : []
+  })
+  const peekLocation = createMemo(() => peekSession()?.location ?? peekSnapshot()?.location)
+  const peekPermissions = createMemo<PermissionRequest[] | undefined>(() => {
+    const id = peekID()
+    return id ? context.data.session.permission.list(id) : undefined
+  })
+  const peekForms = createMemo(() => {
+    const id = peekID()
+    return id ? context.data.session.form.list(id, peekLocation()) : undefined
+  })
+  const peekAttention = createMemo(() =>
+    classifyNeedsInput({ permissions: peekPermissions(), forms: peekForms() }),
+  )
+  const peekRunning = createMemo(() => {
+    const session = peekSession()
+    return session !== undefined && context.data.session.status(session.id) === "running"
+  })
+  const peekActive = createMemo(() => activeTool(peekMessages(), peekRunning()))
+  const peekLatest = createMemo(() => latestAction(peekMessages()))
+  const peekExcerpt = createMemo(() =>
+    assistantExcerpt(peekMessages(), {
+      maxChars: wide() ? 600 : 320,
+      maxLines: wide() ? 10 : 5,
+    }),
+  )
+  const peekActivity = createMemo(() =>
+    latestActivityAt(peekMessages(), peekSession()?.time.updated ?? 0),
+  )
+  const peekTitle = createMemo(() => {
+    const value = peekSession()?.title ?? peekSnapshot()?.title ?? "(untitled)"
+    return sanitizeTerminalText(value)
+  })
+  const peekDirectory = createMemo(() => {
+    const value = peekSession()?.location.directory ?? peekSnapshot()?.directory ?? "?"
+    return sanitizeTerminalText(context.ui.format.path(value))
+  })
+  const previewTextWidth = () => Math.max(12, (wide() ? PREVIEW_WIDTH : width()) - 4)
+  const peekHistoryNote = createMemo(() => {
+    const history = peekHistory()
+    const hasMessages = peekMessages().length > 0
+    if (!peekID()) return undefined
+    if (!peekSession()) return "Session no longer available."
+    if (history?.status === "loading") return hasMessages ? "Updating history…" : "Loading history…"
+    if (history?.status === "error") {
+      const message = sanitizeTerminalText(history.error ?? "fetch failed")
+      return hasMessages ? `History may be stale: ${message}` : `History unavailable: ${message}`
+    }
+    if (history?.fallback) return "Showing a direct snapshot; live history is unavailable."
+    if (!hasMessages) return "No messages yet."
+    return undefined
+  })
+  const peekStateLabel = createMemo(() => {
+    if (peekID() && !peekSession()) return "unavailable"
+    if (peekAttention()?.kind === "permission") return "waiting for permission"
+    if (peekAttention()?.kind === "question") return "waiting for answer"
+    return peekRunning() ? "running" : "idle"
+  })
+  const peekStateColor = createMemo(() => {
+    if (peekID() && !peekSession()) return theme.text.feedback.warning.base
+    if (peekAttention()?.kind === "permission") return theme.text.feedback.warning.base
+    if (peekAttention()?.kind === "question") return theme.hue.accent[200]
+    return peekRunning() ? theme.text.feedback.info.base : theme.text.muted
+  })
+
+  const loadPeek = (session: SessionInfo) => {
+    const id = session.id
+    const request = ++previewRequest
+    setPeekHistory({ id, status: "loading" })
+    const api = previewApi(context)
+    if (api) {
+      void api.sync(id).then(
+        () => {
+          if (request !== previewRequest || peekID() !== id) return
+          setPeekHistory({ id, status: "ready" })
+        },
+        (error: unknown) => {
+          if (request !== previewRequest || peekID() !== id) return
+          setPeekHistory({ id, status: "error", error: errorText(error) })
+        },
+      )
+      return
+    }
+    void context.client.message.list({ sessionID: id, limit: 20, order: "desc" }).then(
+      (response) => {
+        if (request !== previewRequest || peekID() !== id) return
+        setFallbackMessages({ id, messages: [...response.data].reverse() })
+        setPeekHistory({ id, status: "ready", fallback: true })
+      },
+      (error: unknown) => {
+        if (request !== previewRequest || peekID() !== id) return
+        setPeekHistory({ id, status: "error", error: errorText(error) })
+      },
+    )
+  }
+
+  const openPeek = () => {
+    const session = visible()[selectedIndex()]
+    if (!session) return
+    setPeekSnapshot({
+      id: session.id,
+      title: titleLabel(session),
+      directory: session.location.directory,
+      location: session.location,
+    })
+    setPeekID(session.id)
+    setFallbackMessages(undefined)
+    if (context.data.session.permission.list(session.id) === undefined) {
+      void context.data.session.permission.sync(session.id).catch(() => {})
+    }
+    if (context.data.session.form.list(session.id, session.location) === undefined) {
+      void context.data.session.form.sync(session.id, session.location).catch(() => {})
+    }
+    loadPeek(session)
+  }
+
+  const closePeek = () => {
+    previewRequest += 1
+    setPeekID(undefined)
+    setPeekSnapshot(undefined)
+    setPeekHistory(undefined)
+    setFallbackMessages(undefined)
+  }
+
+  const togglePeek = () => {
+    if (peekID()) closePeek()
+    else openPeek()
+  }
+
+  const refreshPeek = () => {
+    const session = peekSession()
+    if (session) loadPeek(session)
+  }
+
   const switchFilter = (filter: GangwayFilter) => {
     if (filter === props.filter()) return
     props.setFilter(filter)
@@ -150,11 +374,24 @@ function SessionsPage(props: {
 
   onMount(() => {
     void hydrate(context)
+    const measure = () => setWidth(terminalWidth(context))
+    measure()
+    process.stdout.on("resize", measure)
+    const ticker = setInterval(() => setNow(Date.now()), AGE_TICK_MS)
+    onCleanup(() => {
+      previewRequest += 1
+      process.stdout.off("resize", measure)
+      clearInterval(ticker)
+    })
   })
 
   const open = (session: SessionInfo) => {
     context.ui.router.navigate({ type: "session", sessionID: session.id })
   }
+
+  const selectedSession = () => visible()[selectedIndex()]
+  const selectedSessionID = () => selectedSession()?.id
+  const openStats = () => props.stats.open({ directory: directory() })
 
   const interrupt = (session: SessionInfo) => {
     void context.client.session.interrupt({ sessionID: session.id }).then(
@@ -173,6 +410,20 @@ function SessionsPage(props: {
           if (session) open(session)
         },
       },
+      {
+        bind: "p",
+        title: peekID() ? "Close peek" : "Peek session",
+        run: togglePeek,
+      },
+      {
+        bind: STATS_SHORTCUT,
+        title: "Gangway stats",
+        group: "Gangway",
+        run: openStats,
+      },
+      changesKeyCommand(context, selectedSessionID),
+      dispatchKeyCommand(context, selectedSessionID),
+      timelineKeyCommand(context, selectedSessionID),
       {
         bind: "up,k",
         title: "Previous session",
@@ -194,7 +445,10 @@ function SessionsPage(props: {
       {
         bind: "r",
         title: "Refresh",
-        run: () => void hydrate(context),
+        run: () => {
+          void hydrate(context)
+          refreshPeek()
+        },
       },
       ...GANGWAY_FILTERS.map((filter, index) => ({
         bind: String(index + 1),
@@ -206,12 +460,21 @@ function SessionsPage(props: {
 
   // Escape must leave this page even if the session input mode stack is not at
   // base (background tabs can leave a form/autocomplete mode pushed). Modal
-  // dialogs keep their own escape handling.
+  // dialogs keep their own escape handling. An open peek owns the first escape.
   context.keymap.layer(() => ({
     mode: "global",
     priority: 1,
     enabled: () => context.keymap.mode.current() !== "modal",
-    commands: [{ bind: "escape", title: "Back", run: props.onBack }],
+    commands: [
+      {
+        bind: "escape",
+        title: peekID() ? "Close peek" : "Back",
+        run: () => {
+          if (peekID()) closePeek()
+          else props.onBack()
+        },
+      },
+    ],
   }))
 
   return (
@@ -246,57 +509,162 @@ function SessionsPage(props: {
           </For>
         </box>
       </box>
-      <scrollbox flexGrow={1} minHeight={0}>
-        <Show
-          when={visible().length > 0}
-          fallback={<EmptyState context={context} filter={() => props.filter()} directory={directory()} />}
-        >
-          <For each={visible()}>
-            {(session, index) => {
-              const running = () => statusOf(session) === "running"
-              const attention = () => attentionOf(session)
-              const glyphColor = () => {
-                const needs = attention()
-                if (needs?.kind === "permission") return theme.text.feedback.warning.base
-                if (needs?.kind === "question") return theme.hue.accent[200]
-                return running() ? theme.text.feedback.info.base : theme.text.muted
-              }
-              const active = () => index() === selectedIndex()
-              return (
-                <box
-                  flexShrink={0}
-                  flexDirection="row"
-                  gap={1}
-                  paddingLeft={2}
-                  paddingRight={2}
-                  backgroundColor={active() ? theme.background.raised.high : undefined}
-                >
-                  <box width={2} flexShrink={0}>
-                    <text fg={glyphColor()}>{sessionGlyph(statusOf(session), attention())}</text>
+      <box flexGrow={1} minHeight={0} flexDirection={wide() ? "row" : "column"} gap={wide() ? 1 : 0}>
+        <scrollbox flexGrow={1} minWidth={0} minHeight={0}>
+          <Show
+            when={visible().length > 0}
+            fallback={<EmptyState context={context} filter={() => props.filter()} directory={directory()} />}
+          >
+            <For each={visible()}>
+              {(session, index) => {
+                const running = () => statusOf(session) === "running"
+                const attention = () => attentionOf(session)
+                const glyphColor = () => {
+                  const needs = attention()
+                  if (needs?.kind === "permission") return theme.text.feedback.warning.base
+                  if (needs?.kind === "question") return theme.hue.accent[200]
+                  return running() ? theme.text.feedback.info.base : theme.text.muted
+                }
+                const active = () => index() === selectedIndex()
+                return (
+                  <box
+                    flexShrink={0}
+                    flexDirection="row"
+                    gap={1}
+                    paddingLeft={2}
+                    paddingRight={2}
+                    backgroundColor={active() ? theme.background.raised.high : undefined}
+                  >
+                    <box width={2} flexShrink={0}>
+                      <text fg={glyphColor()}>{sessionGlyph(statusOf(session), attention())}</text>
+                    </box>
+                    <box flexGrow={1} minWidth={0} flexShrink={1}>
+                      <text fg={theme.text.base}>{titleLabel(session)}</text>
+                    </box>
+                    <box width={MODEL_WIDTH} flexShrink={0}>
+                      <text fg={theme.text.muted}>{truncateHead(modelLabel(session), MODEL_WIDTH)}</text>
+                    </box>
+                    <box width={5} flexShrink={0}>
+                      <text fg={theme.text.muted}>{formatAge(session.time.updated).padStart(5)}</text>
+                    </box>
+                    <box width={PATH_WIDTH} flexShrink={0}>
+                      <text fg={theme.text.muted}>
+                        {truncatePath(context.ui.format.path(session.location.directory), PATH_WIDTH)}
+                      </text>
+                    </box>
                   </box>
-                  <box flexGrow={1} minWidth={0} flexShrink={1}>
-                    <text fg={theme.text.base}>{titleLabel(session)}</text>
-                  </box>
-                  <box width={MODEL_WIDTH} flexShrink={0}>
-                    <text fg={theme.text.muted}>{truncateHead(modelLabel(session), MODEL_WIDTH)}</text>
-                  </box>
-                  <box width={5} flexShrink={0}>
-                    <text fg={theme.text.muted}>{formatAge(session.time.updated).padStart(5)}</text>
-                  </box>
-                  <box width={PATH_WIDTH} flexShrink={0}>
-                    <text fg={theme.text.muted}>
-                      {truncatePath(context.ui.format.path(session.location.directory), PATH_WIDTH)}
+                )
+              }}
+            </For>
+          </Show>
+        </scrollbox>
+        <Show when={peekID()}>
+          <box
+            width={wide() ? PREVIEW_WIDTH : undefined}
+            height={wide() ? undefined : PREVIEW_HEIGHT}
+            flexShrink={0}
+            minHeight={0}
+            flexDirection="column"
+            backgroundColor={theme.background.raised.high}
+            paddingLeft={2}
+            paddingRight={2}
+            paddingTop={1}
+            paddingBottom={1}
+          >
+            <box flexShrink={0} flexDirection="row" justifyContent="space-between" gap={1}>
+              <text fg={theme.text.base}>
+                <b>Peek</b>
+              </text>
+              <text fg={theme.text.muted}>{wide() ? "p/esc close" : "esc close"}</text>
+            </box>
+            <text fg={theme.text.base}>{truncateHead(peekTitle(), previewTextWidth())}</text>
+            <text fg={theme.text.muted}>{truncatePath(peekDirectory(), previewTextWidth())}</text>
+            <box flexShrink={0} flexDirection="row" gap={1}>
+              <text fg={peekStateColor()}>{peekStateLabel()}</text>
+              <text fg={theme.text.muted}>{`· last activity ${ageLabel(peekActivity(), now())}`}</text>
+            </box>
+            <Show when={(peekPermissions()?.length ?? 0) > 0}>
+              <For each={peekPermissions()!.slice(0, 2)}>
+                {(permission) => (
+                  <box flexShrink={0}>
+                    <text fg={theme.text.feedback.warning.base}>
+                      {truncateHead(
+                        `! Permission · ${sanitizeTerminalText(permission.action)}`,
+                        previewTextWidth(),
+                      )}
                     </text>
+                    <Show when={permission.resources.length > 0}>
+                      <text fg={theme.text.muted}>
+                        {truncateHead(
+                          sanitizeTerminalText(permission.resources.join(", ")),
+                          previewTextWidth(),
+                        )}
+                      </text>
+                    </Show>
                   </box>
-                </box>
-              )
-            }}
-          </For>
+                )}
+              </For>
+            </Show>
+            <Show when={(peekForms()?.length ?? 0) > 0}>
+              <For each={peekForms()!.slice(0, 2)}>
+                {(form) => (
+                  <text fg={theme.hue.accent[200]}>
+                    {truncateHead(`? ${sanitizeTerminalText(form.title)}`, previewTextWidth())}
+                  </text>
+                )}
+              </For>
+            </Show>
+            <Show when={peekHistoryNote()}>
+              {(note) => (
+                <text
+                  fg={peekHistory()?.status === "error" ? theme.text.feedback.warning.base : theme.text.muted}
+                >
+                  {note()}
+                </text>
+              )}
+            </Show>
+            <scrollbox flexGrow={1} minHeight={0}>
+              <Show
+                when={peekActive()}
+                fallback={
+                  <Show when={peekLatest()}>
+                    {(latest) => (
+                      <text fg={theme.text.muted}>
+                        {truncateHead(
+                          `${latest().kind === "tool" ? "Tool" : "Shell"} · ${sanitizeTerminalText(latest().name)} · ${latest().status} · ${ageLabel(latest().timestamp, now())}`,
+                          previewTextWidth(),
+                        )}
+                      </text>
+                    )}
+                  </Show>
+                }
+              >
+                {(active) => (
+                  <text fg={theme.text.feedback.info.base}>
+                    {truncateHead(
+                      `Active tool · ${sanitizeTerminalText(active().name)} · ${active().status}`,
+                      previewTextWidth(),
+                    )}
+                  </text>
+                )}
+              </Show>
+              <Show when={peekExcerpt()}>
+                {(excerpt) => (
+                  <>
+                    <box flexShrink={0} paddingTop={1}>
+                      <text fg={theme.text.muted}>{excerpt().earlier ? "Earlier output" : "Latest output"}</text>
+                    </box>
+                    <text fg={theme.text.base}>{excerpt().text}</text>
+                  </>
+                )}
+              </Show>
+            </scrollbox>
+          </box>
         </Show>
-      </scrollbox>
+      </box>
       <box flexShrink={0} paddingLeft={2} paddingRight={2} paddingBottom={1}>
         <text fg={theme.text.muted}>
-          {`${waiting() > 0 ? `${waiting()} waiting · ` : ""}1/2/3 filter · j/k move · enter open · i interrupt · r refresh · esc back`}
+          {`${waiting() > 0 ? `${waiting()} waiting · ` : ""}1/2/3 filter · j/k · enter open · p ${peekID() ? "close peek" : "peek"} · s stats · a inbox · d changes · o dispatch · t timeline · u usage · i stop · r refresh · esc ${peekID() ? "close peek" : "back"}`}
         </text>
       </box>
     </box>
@@ -332,6 +700,23 @@ export default Plugin.define({
     void hydrate(context)
     const interval = setInterval(() => void hydrate(context), REFRESH_MS)
 
+    // Standalone feature routes. Each owns its page component and view-local
+    // bindings; the sessions list contributes only the entry action.
+    const stats = createGangwayStats(context, {
+      historyLimit: LIST_LIMIT,
+      onRefresh: () => void hydrate(context),
+    })
+    const changes = registerChangesView(context, { sessionsPage: PAGE })
+    const unregisterDispatch = registerDispatchRoute(context)
+    const unregisterTimeline = registerTimelineRoute(context)
+    const inbox = installInbox(context)
+    const unregisterUsage = registerUsageFeature(context, {
+      enabled: () => {
+        const route = context.ui.router.current()
+        return route.type === "plugin" && route.name === PAGE && context.keymap.mode.current() !== "modal"
+      },
+    })
+
     // Returning to a session route that is gone (closed tab, deleted session,
     // unresolved --continue placeholder) would land on a blank page. Fall back
     // to the new-chat home route instead.
@@ -359,6 +744,7 @@ export default Plugin.define({
           filter={() => prefs.filter}
           setFilter={(filter) => void updatePrefs((draft) => (draft.filter = filter))}
           onBack={back}
+          stats={stats}
         />
       ),
     })
@@ -498,6 +884,12 @@ export default Plugin.define({
 
     return () => {
       clearInterval(interval)
+      unregisterUsage()
+      inbox.dispose()
+      unregisterTimeline()
+      unregisterDispatch()
+      changes.unregister()
+      stats.dispose()
       unregisterRoute()
       unregisterAppSlot()
       unregisterStatus()

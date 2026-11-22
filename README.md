@@ -188,6 +188,10 @@ Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions p
   sessions from other directories are hydrated at startup and on a 5 s fallback sweep (which
   also syncs unknown permission/form lists for busy sessions); the page also handles `r`.
 - `enter` opens the session, `i` interrupts it, `j`/`k` move selection, `esc` returns.
+- Read-only views open from the list: `p` session peek, `s` live stats, `a` cross-directory
+  needs-input inbox, `d` latest-turn changes, `o` recorded dispatch details, `t` activity
+  timeline, and `u` token/cost usage. Each returns with `esc`; `p`/`d`/`o`/`t` pin the selected
+  session ID, and `enter` on an inbox or stats row opens the owning session.
 - The home footer shows a `gangway N` counter (plus `· M waiting` when sessions need input), and
   a toast announces each new gangway session, pending permission request and question form
   (one toast per request/form, cleared when answered or cancelled). Toasts are display-only:
@@ -315,6 +319,9 @@ above). An external port collision is reported as a plugin failure.
 - `index.ts` — package directory entry point for the global OpenCode loader.
 - `tui.ts` — TUI entry re-export; `src/tui.tsx` renders the live gangway sessions panel
   (route + keymap + slots), `src/tui-helpers.ts` holds the pure session filters/labels.
+- `src/tui-preview.ts`, `src/tui-stats.tsx`, `src/tui-inbox.tsx`, `src/tui-changes*.ts(x)`,
+  `src/tui-dispatch*.ts(x)`, `src/tui-timeline*.ts(x)`, `src/tui-usage*.ts(x)` — feature-local
+  projections/routes for peek, stats, inbox, changes, dispatch, timeline and usage.
 - `src/mcp.ts` — MCP server (streamable HTTP, stateless), per-request context resolution + tools.
 - `src/lifecycle.ts` — process-lifetime endpoint ownership, lease handover, HTTP reacquisition,
   shutdown cleanup and rendezvous file.
