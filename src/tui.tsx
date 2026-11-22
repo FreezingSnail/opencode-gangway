@@ -196,17 +196,22 @@ function SessionsPage(props: {
         title: "Refresh",
         run: () => void hydrate(context),
       },
-      {
-        bind: "escape",
-        title: "Back",
-        run: props.onBack,
-      },
       ...GANGWAY_FILTERS.map((filter, index) => ({
         bind: String(index + 1),
         title: `Filter: ${FILTER_LABEL[filter]}`,
         run: () => switchFilter(filter),
       })),
     ],
+  }))
+
+  // Escape must leave this page even if the session input mode stack is not at
+  // base (background tabs can leave a form/autocomplete mode pushed). Modal
+  // dialogs keep their own escape handling.
+  context.keymap.layer(() => ({
+    mode: "global",
+    priority: 1,
+    enabled: () => context.keymap.mode.current() !== "modal",
+    commands: [{ bind: "escape", title: "Back", run: props.onBack }],
   }))
 
   return (
@@ -327,6 +332,25 @@ export default Plugin.define({
     void hydrate(context)
     const interval = setInterval(() => void hydrate(context), REFRESH_MS)
 
+    // Returning to a session route that is gone (closed tab, deleted session,
+    // unresolved --continue placeholder) would land on a blank page. Fall back
+    // to the new-chat home route instead.
+    const back = () => {
+      const target = previous()
+      if (target.type === "session") {
+        const info = context.data.session.get(target.sessionID)
+        const open = !context.ui.tabs.enabled() || context.ui.tabs.list().some((tab) => tab.sessionID === target.sessionID)
+        if (target.sessionID === "dummy" || !info || !open) {
+          context.ui.router.navigate({
+            type: "home",
+            location: info?.location ?? context.location ?? context.data.location.default(),
+          })
+          return
+        }
+      }
+      context.ui.router.navigate(target)
+    }
+
     const unregisterRoute = context.ui.router.register({
       name: PAGE,
       render: () => (
@@ -334,7 +358,7 @@ export default Plugin.define({
           context={context}
           filter={() => prefs.filter}
           setFilter={(filter) => void updatePrefs((draft) => (draft.filter = filter))}
-          onBack={() => context.ui.router.navigate(previous())}
+          onBack={back}
         />
       ),
     })
