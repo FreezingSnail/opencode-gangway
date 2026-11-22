@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
+import { detectNeedsInput, type NeedsInput } from "./attention"
 
 export const TAG = "[gangway]"
 export const DEFAULT_MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
@@ -62,6 +63,15 @@ export interface Ctx {
       entries: Array<{ key: string; value: unknown }>
       next?: string
     }>
+  }
+  // Optional per-instance attention queues. The real plugin context exposes
+  // `permission` but not `form`; test contexts may expose both. They are used
+  // only for sessions in this instance's own directory (see src/attention.ts).
+  permission?: {
+    list(input: { sessionID: string }): Promise<unknown>
+  }
+  form?: {
+    list(input: { sessionID: string }): Promise<unknown>
   }
 }
 
@@ -167,23 +177,60 @@ function outputIdOf(message: any, tail: any): string | null {
 
 // Legacy idle wait (no requestID): unchanged behavior, bounded by the caller
 // window. It cannot bind to a specific turn, so an already-idle session returns
-// immediately; requestID operations use the boundary-aware path below.
-async function waitForIdle(ctx: Ctx, sessionID: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  try {
-    await withTimeout(Promise.resolve(ctx.session.wait({ sessionID })), timeoutMs)
-    return true
-  } catch (error) {
-    if (error instanceof TimeoutError) return false
-    // ctx.session.wait may be unavailable on older services; fall back to
-    // polling the transcript for a trailing idle message.
-    while (Date.now() < deadline) {
-      await sleep(1500)
-      const latest = await lastAssistant(ctx, sessionID)
-      if (latest.idle) return true
+// immediately; requestID operations use the boundary-aware path below. Attention
+// probes interrupt the wait early so a stalled session reports needsInput
+// instead of blocking until the deadline.
+interface IdleOutcome {
+  idle: boolean
+  needsInput: NeedsInput | null
+}
+
+async function waitForIdle(
+  ctx: Ctx,
+  sessionID: string,
+  timeoutMs: number,
+  directory?: string | null,
+): Promise<IdleOutcome> {
+  const deadline = Date.now() + Math.max(0, timeoutMs)
+  const attention = () => detectNeedsInput(ctx, sessionID, directory)
+  const first = await attention()
+  if (first) return { idle: false, needsInput: first }
+
+  let waitState: "ok" | "error" | null = null
+  const waiting = Promise.resolve(ctx.session.wait({ sessionID })).then(
+    () => {
+      waitState = "ok"
+    },
+    () => {
+      waitState = "error"
+    },
+  )
+
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return { idle: false, needsInput: await attention() }
+    const slice = await Promise.race([
+      waiting.then(() => "wait" as const),
+      sleep(Math.min(1500, remaining)).then(() => "tick" as const),
+    ])
+    if (slice === "wait") {
+      if (waitState === "ok") return { idle: true, needsInput: null }
+      break
     }
-    return false
+    const found = await attention()
+    if (found) return { idle: false, needsInput: found }
   }
+
+  // ctx.session.wait may be unavailable on older services; fall back to
+  // polling the transcript for a trailing idle message.
+  while (Date.now() < deadline) {
+    await sleep(Math.min(1500, Math.max(0, deadline - Date.now())))
+    const found = await attention()
+    if (found) return { idle: false, needsInput: found }
+    const latest = await lastAssistant(ctx, sessionID)
+    if (latest.idle) return { idle: true, needsInput: null }
+  }
+  return { idle: false, needsInput: await attention() }
 }
 
 function reply(payload: unknown) {
@@ -473,14 +520,33 @@ async function submitPrompt(ctx: Ctx, op: OperationRecord, text: string): Promis
   return op
 }
 
-async function waitForCompletion(ctx: Ctx, start: OperationRecord, budgetMs: number): Promise<OperationRecord> {
+interface WaitOutcome {
+  op: OperationRecord
+  needsInput: NeedsInput | null
+}
+
+async function waitForCompletion(
+  ctx: Ctx,
+  start: OperationRecord,
+  budgetMs: number,
+  directory?: string | null,
+): Promise<WaitOutcome> {
   const deadline = Date.now() + Math.max(0, budgetMs)
+  const attention = (sessionID: string) =>
+    detectNeedsInput(ctx, sessionID, directory ?? start.identity.directory)
   let op = start
   for (;;) {
     op = await reconcileOperation(ctx, op)
-    if (isTerminal(op)) return op
+    if (isTerminal(op)) return { op, needsInput: null }
+    // A stalled session does not advance its transcript. Report the stall now
+    // instead of waiting out the caller's budget; operation state is untouched,
+    // so a later wait resumes normally once the user answers in the TUI.
+    if (op.sessionID != null) {
+      const found = await attention(op.sessionID)
+      if (found) return { op, needsInput: found }
+    }
     const remaining = deadline - Date.now()
-    if (remaining <= 0) return op
+    if (remaining <= 0) return { op, needsInput: null }
     const slice = Math.min(remaining, 5_000)
     if (op.sessionID != null) {
       try {
@@ -662,7 +728,13 @@ async function preparePrompt(
   })
 }
 
-function statusPayload(op: OperationRecord, info: Record<string, any>) {
+// Attention is reported on the wait early-return path. The operation state is
+// deliberately not advanced: the run is still alive, merely waiting on the user.
+function attentionFields(needsInput: NeedsInput) {
+  return { needsInput, waitResult: "needs-input", timedOut: false }
+}
+
+function statusPayload(op: OperationRecord, info: Record<string, any>, needsInput: NeedsInput | null) {
   return {
     requestID: op.requestID,
     sessionID: op.sessionID,
@@ -676,6 +748,7 @@ function statusPayload(op: OperationRecord, info: Record<string, any>) {
     outputId: op.completion?.outputId ?? null,
     completed: isTerminal(op),
     error: op.error,
+    needsInput,
     ...(op.warnings?.length ? { warnings: op.warnings } : {}),
     session: {
       title: info.title ?? null,
@@ -727,9 +800,17 @@ export function registerBridgeTools(
           await ctx.session.get({ sessionID: args.sessionID })
           await ctx.session.prompt({ sessionID: args.sessionID, text: args.prompt })
           if (!args.wait) return reply({ sessionID: args.sessionID, status: "queued" })
-          const idle = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
+          const outcome = await waitForIdle(
+            ctx,
+            args.sessionID,
+            args.timeoutMs ?? defaultWaitMs,
+            args.directory ?? ctx.location?.directory ?? null,
+          )
           const latest = await lastAssistant(ctx, args.sessionID)
-          return reply({ sessionID: args.sessionID, status: idle ? "idle" : "busy", ...latest })
+          if (outcome.needsInput) {
+            return reply({ sessionID: args.sessionID, status: "busy", ...attentionFields(outcome.needsInput), ...latest })
+          }
+          return reply({ sessionID: args.sessionID, status: outcome.idle ? "idle" : "busy", ...latest })
         }
         const title = `${titlePrefix} ${args.title ?? short(args.prompt)}`
         const created = await ctx.session.create({
@@ -752,9 +833,17 @@ export function registerBridgeTools(
         }
         await ctx.session.prompt({ sessionID: created.id, text: args.prompt })
         if (!args.wait) return reply({ sessionID: created.id, status: "started" })
-        const idle = await waitForIdle(ctx, created.id, args.timeoutMs ?? defaultWaitMs)
+        const outcome = await waitForIdle(
+          ctx,
+          created.id,
+          args.timeoutMs ?? defaultWaitMs,
+          args.directory ?? ctx.location?.directory ?? null,
+        )
         const latest = await lastAssistant(ctx, created.id)
-        return reply({ sessionID: created.id, status: idle ? "idle" : "busy", ...latest })
+        if (outcome.needsInput) {
+          return reply({ sessionID: created.id, status: "busy", ...attentionFields(outcome.needsInput), ...latest })
+        }
+        return reply({ sessionID: created.id, status: outcome.idle ? "idle" : "busy", ...latest })
       }
 
       requireStorage(ctx)
@@ -774,9 +863,12 @@ export function registerBridgeTools(
         defaultWaitMs,
       )
       if (!args.wait) return reply({ ...operationSummary(op), worstCaseWaitMs: defaultWaitMs })
-      const finished = isTerminal(op) ? op : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
-      if (isTerminal(finished)) return reply(completionSummary(finished))
-      return reply(operationSummary(finished, { timedOut: true, reason: reason ?? "wait-expired" }))
+      const outcome = isTerminal(op)
+        ? { op, needsInput: null }
+        : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
+      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
+      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
+      return reply(operationSummary(outcome.op, { timedOut: true, reason: reason ?? "wait-expired" }))
     },
   )
 
@@ -801,18 +893,29 @@ export function registerBridgeTools(
         await ctx.session.get({ sessionID: args.sessionID })
         await ctx.session.prompt({ sessionID: args.sessionID, text: args.text })
         if (!args.wait) return reply({ sessionID: args.sessionID, status: "queued" })
-        const idle = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
+        const outcome = await waitForIdle(
+          ctx,
+          args.sessionID,
+          args.timeoutMs ?? defaultWaitMs,
+          ctx.location?.directory ?? null,
+        )
         const latest = await lastAssistant(ctx, args.sessionID)
-        return reply({ sessionID: args.sessionID, status: idle ? "idle" : "busy", ...latest })
+        if (outcome.needsInput) {
+          return reply({ sessionID: args.sessionID, status: "busy", ...attentionFields(outcome.needsInput), ...latest })
+        }
+        return reply({ sessionID: args.sessionID, status: outcome.idle ? "idle" : "busy", ...latest })
       }
 
       requireStorage(ctx)
       await ctx.session.get({ sessionID: args.sessionID })
       const { op } = await preparePrompt(ctx, args.requestID, { sessionID: args.sessionID, text: args.text })
       if (!args.wait) return reply({ ...operationSummary(op), worstCaseWaitMs: defaultWaitMs })
-      const finished = isTerminal(op) ? op : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
-      if (isTerminal(finished)) return reply(completionSummary(finished))
-      return reply(operationSummary(finished, { timedOut: true, reason: "wait-expired" }))
+      const outcome = isTerminal(op)
+        ? { op, needsInput: null }
+        : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
+      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
+      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
+      return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }))
     },
   )
 
@@ -835,13 +938,17 @@ export function registerBridgeTools(
         }
         const reconciled = await reconcileOperation(ctx, op)
         if (isTerminal(reconciled)) return reply(completionSummary(reconciled))
-        const finished = await waitForCompletion(ctx, reconciled, args.timeoutMs ?? defaultWaitMs)
-        if (isTerminal(finished)) return reply(completionSummary(finished))
-        return reply(operationSummary(finished, { timedOut: true, reason: "wait-expired" }))
+        const outcome = await waitForCompletion(ctx, reconciled, args.timeoutMs ?? defaultWaitMs)
+        if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
+        if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
+        return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }))
       }
-      const idle = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
+      const outcome = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
       const latest = await lastAssistant(ctx, args.sessionID)
-      return reply({ sessionID: args.sessionID, status: idle ? "idle" : "busy", ...latest })
+      if (outcome.needsInput) {
+        return reply({ sessionID: args.sessionID, status: "busy", ...attentionFields(outcome.needsInput), ...latest })
+      }
+      return reply({ sessionID: args.sessionID, status: outcome.idle ? "idle" : "busy", ...latest })
     },
   )
 
@@ -869,11 +976,17 @@ export function registerBridgeTools(
               state: "unknown",
               status: "unknown",
               error: "unknown requestID",
+              needsInput: await detectNeedsInput(ctx, args.sessionID, info?.location?.directory),
               session: { outcome: info.outcome ?? null, updated: info.time?.updated ?? null },
             })
           }
           if (args.reconcile) op = await reconcileOperation(ctx, op)
-          return reply(statusPayload(op, info))
+          // Stalls are only meaningful while the turn is nonterminal; a finished
+          // operation reports `needsInput: null` explicitly.
+          const needsInput = isTerminal(op)
+            ? null
+            : await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
+          return reply(statusPayload(op, info, needsInput))
         })
       }
 
@@ -890,6 +1003,7 @@ export function registerBridgeTools(
         lastMessageType: latest.lastMessageType,
         idle: latest.idle,
         tail: short(latest.text, 500),
+        needsInput: await detectNeedsInput(ctx, args.sessionID, info?.location?.directory),
       })
     },
   )
@@ -917,7 +1031,10 @@ export function registerBridgeTools(
           }
           const op = await reconcileOperation(ctx, loaded)
           if (!isTerminal(op) || !op.completion) {
-            return reply(operationSummary(op, { unchanged: false }))
+            const needsInput = isTerminal(op)
+              ? null
+              : await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
+            return reply(operationSummary(op, { unchanged: false, needsInput }))
           }
           const c = op.completion
           const unchanged = args.force !== true && op.lastOutputId === c.outputId

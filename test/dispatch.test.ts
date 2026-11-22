@@ -69,6 +69,13 @@ class MemoryStorage {
 class Backend {
   readonly storage = new MemoryStorage()
   readonly sessions = new Map<string, Session>()
+  // Attention queues: pending permission requests and question forms keyed by
+  // session id. The bridge uses the matching ctx seams (no network) because the
+  // fake context's location is the same directory for every session.
+  readonly permissions = new Map<string, unknown[]>()
+  readonly forms = new Map<string, unknown[]>()
+  failPermissionProbe = false
+  failFormProbe = false
   readonly createCalls: Array<Record<string, any>> = []
   readonly promptCalls: Array<{ sessionID: string; text: string; id?: string }> = []
   readonly interruptCalls: string[] = []
@@ -170,6 +177,18 @@ class Backend {
         wait: async ({ sessionID }: { sessionID: string }) => {
           this.waitCalls.push(sessionID)
           return {}
+        },
+      },
+      permission: {
+        list: async ({ sessionID }: { sessionID: string }) => {
+          if (this.failPermissionProbe) throw new Error("permission probe unavailable")
+          return this.permissions.get(sessionID) ?? []
+        },
+      },
+      form: {
+        list: async ({ sessionID }: { sessionID: string }) => {
+          if (this.failFormProbe) throw new Error("form probe unavailable")
+          return this.forms.get(sessionID) ?? []
         },
       },
       storage: this.storage,
@@ -613,6 +632,156 @@ describe("generated operation sequences", () => {
       expect(backend.createAttempts).toBe(distinct)
       expect(backend.promptCalls.length).toBe(distinct)
       expect(byRequest.size).toBe(distinct)
+    } finally {
+      server.stop()
+    }
+  })
+})
+
+describe("needsInput attention reporting", () => {
+  test("a pending permission request reports needsInput and wait returns early, then resumes", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const { server } = harness({ backend })
+    try {
+      const started = payload(
+        await callTool(server, "opencode_start_session", { prompt: "needs approval", requestID: "req-attn", wait: false }),
+      )
+      const requests = [{ id: "perm_1", action: "shell", resources: ["npm install"], message: "approve shell" }]
+      backend.permissions.set(started.sessionID, requests)
+
+      const status = payload(
+        await callTool(server, "opencode_status", { sessionID: started.sessionID, requestID: "req-attn" }),
+      )
+      expect(status.status).toBe("running")
+      expect(status.needsInput.kind).toBe("permission")
+      expect(status.needsInput.requests).toEqual(requests)
+      expect(status.needsInput.forms).toEqual([])
+
+      const begin = Date.now()
+      const stalled = payload(
+        await callTool(server, "opencode_wait", {
+          sessionID: started.sessionID,
+          requestID: "req-attn",
+          timeoutMs: 5_000,
+        }),
+      )
+      const elapsed = Date.now() - begin
+      expect(elapsed).toBeLessThan(1_000)
+      expect(stalled.status).toBe("running")
+      expect(stalled.state).not.toBe("completed")
+      expect(stalled.needsInput.kind).toBe("permission")
+      expect(stalled.waitResult).toBe("needs-input")
+      expect(stalled.timedOut).toBe(false)
+      expect(backend.interruptCalls.length).toBe(0) // attention never cancels the run
+
+      // Answering in the TUI clears the queue; the same recorded operation resumes.
+      backend.permissions.delete(started.sessionID)
+      backend.completeTurn(started.sessionID, "approved and done")
+      const resumed = payload(
+        await callTool(server, "opencode_wait", {
+          sessionID: started.sessionID,
+          requestID: "req-attn",
+          timeoutMs: 5_000,
+        }),
+      )
+      expect(resumed.state).toBe("completed")
+      expect(resumed.text).toBe("approved and done")
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("a permission request whose action is question is classified as a question", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const { server } = harness({ backend })
+    try {
+      const started = payload(
+        await callTool(server, "opencode_start_session", { prompt: "ask", requestID: "req-qperm", wait: false }),
+      )
+      backend.permissions.set(started.sessionID, [
+        { id: "perm_q", action: "question", resources: null, message: "which option?" },
+      ])
+      const status = payload(
+        await callTool(server, "opencode_status", { sessionID: started.sessionID, requestID: "req-qperm" }),
+      )
+      expect(status.needsInput.kind).toBe("question")
+      expect(status.needsInput.requests).toEqual([
+        { id: "perm_q", action: "question", resources: null, message: "which option?" },
+      ])
+      expect(status.needsInput.forms).toEqual([])
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("a pending question form is the primary question signal", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const { server } = harness({ backend })
+    try {
+      const started = payload(
+        await callTool(server, "opencode_start_session", { prompt: "choose", requestID: "req-form", wait: false }),
+      )
+      backend.forms.set(started.sessionID, [{ id: "form_1", title: "Which option?" }])
+
+      const status = payload(await callTool(server, "opencode_status", { sessionID: started.sessionID }))
+      expect(status.needsInput.kind).toBe("question")
+      expect(status.needsInput.forms).toEqual([{ id: "form_1", title: "Which option?" }])
+      expect(status.needsInput.requests).toEqual([])
+
+      const stalled = payload(
+        await callTool(server, "opencode_wait", {
+          sessionID: started.sessionID,
+          requestID: "req-form",
+          timeoutMs: 5_000,
+        }),
+      )
+      expect(stalled.needsInput.kind).toBe("question")
+      expect(stalled.waitResult).toBe("needs-input")
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("unreadable probes report needsInput null instead of claiming the session needs no input", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const { server } = harness({ backend })
+    try {
+      const started = payload(
+        await callTool(server, "opencode_start_session", { prompt: "probe", requestID: "req-unknown", wait: false }),
+      )
+
+      backend.failPermissionProbe = true
+      const partial = payload(
+        await callTool(server, "opencode_status", { sessionID: started.sessionID, requestID: "req-unknown" }),
+      )
+      expect(partial.needsInput).toBeNull()
+      expect(partial.status).toBe("running")
+
+      backend.failFormProbe = true
+      const unknown = payload(
+        await callTool(server, "opencode_result", { sessionID: started.sessionID, requestID: "req-unknown" }),
+      )
+      expect(unknown.needsInput).toBeNull()
+      expect(unknown.state).not.toBe("completed")
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("a quiet session reports needsInput null", async () => {
+    const backend = new Backend()
+    const { server } = harness({ backend })
+    try {
+      const started = payload(
+        await callTool(server, "opencode_start_session", { prompt: "quiet", requestID: "req-quiet", wait: true }),
+      )
+      expect(started.state).toBe("completed")
+      const status = payload(await callTool(server, "opencode_status", { sessionID: started.sessionID }))
+      expect(status.needsInput).toBeNull()
     } finally {
       server.stop()
     }

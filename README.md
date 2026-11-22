@@ -66,6 +66,47 @@ Unknown outcomes never trigger automatic resend or recreation: if `session.creat
 `prompt` delivery is ambiguous, the operation stays `unknown` and reconciliation only *observes*
 (transcript probe) — it never recreates the session or re-submits the prompt.
 
+### Stalls waiting on the user (`needsInput`)
+
+A session can be alive but unable to make progress because it is waiting for a
+permission approval or an answer to a question form. `opencode_status`,
+`opencode_result` (while nonterminal) and every wait path
+(`opencode_start_session`/`opencode_prompt` with `wait: true`, `opencode_wait`)
+report that stall as `needsInput`. The field is client-agnostic: any MCP harness
+reads the same JSON.
+
+`needsInput` is either `null` or:
+
+```json
+{
+  "kind": "permission",
+  "requests": [{ "id": "per_...", "action": "shell", "resources": ["..."], "message": "..." }],
+  "forms": []
+}
+```
+
+- `kind: "permission"` — a pending permission request the agent needs approved
+  (for example a shell or edit action).
+- `kind: "question"` — a pending question form, or a permission request whose
+  `action` is `question`. Default agents auto-allow the `question` permission, so
+  question stalls usually surface as forms; the form probe is the primary signal.
+- `null` — the bridge could not positively observe a stall: either no pending
+  queue was visible or a probe was unavailable. It is **not** a claim that the
+  session needs nothing.
+
+Detection is best-effort. The bridge consults its own plugin queues when the
+session shares this instance's directory, and otherwise calls the local OpenCode
+service (`GET /api/session/:id/permission` and `/form`) with the `service.json`
+credentials. Unreadable credentials, a pid mismatch, a timeout or any failed
+request yields `null`, never a false "none".
+
+When a wait detects attention it returns immediately (well before `timeoutMs`)
+with the operation's current `status` (`running`/`busy`), `needsInput`,
+`waitResult: "needs-input"` and `timedOut: false`. It does not interrupt the run
+or advance the recorded operation state. Have the user answer in the TUI, then
+call the same wait again: the operation resumes normally. The bridge never
+answers permissions or forms on the user's behalf.
+
 ### Recovery limitations and unresolved decisions
 
 Recorded honestly; no upstream capability is assumed that was not observed:

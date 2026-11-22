@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { dirname } from "node:path"
 import { startMcpServer, type McpServerHandle, type StartOptions } from "./mcp"
+import { readServiceConfig, serviceFetch } from "./service"
 import type { Ctx } from "./tools"
 
 interface Instance {
@@ -161,20 +161,6 @@ async function resolveContext(
   return { ctx: reacquired.ctx, pluginOptions: reacquired.pluginOptions }
 }
 
-function serviceFile(): string {
-  return join(
-    process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"),
-    "opencode",
-    "service.json",
-  )
-}
-
-interface ServiceInfo {
-  url?: unknown
-  pid?: unknown
-  password?: unknown
-}
-
 /**
  * Default location reacquisition: ask the running OpenCode service to boot the
  * requested location through its public HTTP API.
@@ -183,36 +169,12 @@ interface ServiceInfo {
  * service password, which is never logged.
  */
 export async function ensureLocationViaService(directory: string): Promise<void> {
-  const file = serviceFile()
-  let info: ServiceInfo
-  try {
-    info = JSON.parse(readFileSync(file, "utf8")) as ServiceInfo
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`cannot read OpenCode service info at ${file}: ${message}`)
-  }
-
-  if (typeof info.url !== "string" || !info.url) {
-    throw new Error(`OpenCode service info at ${file} has no url`)
-  }
-  if (info.pid !== process.pid) {
-    throw new Error(
-      `OpenCode service pid ${String(info.pid)} does not match process pid ${process.pid}; ` +
-        "refusing to reacquire a location through another process",
-    )
-  }
-
-  const base = info.url.replace(/\/+$/, "")
-  const url = `${base}/api/location?location%5Bdirectory%5D=${encodeURIComponent(directory)}`
-  const headers: Record<string, string> = { accept: "application/json" }
-  if (typeof info.password === "string") {
-    headers.authorization =
-      "Basic " + Buffer.from(`opencode:${info.password}`).toString("base64")
-  }
+  const config = readServiceConfig()
+  const path = `/api/location?location%5Bdirectory%5D=${encodeURIComponent(directory)}`
 
   let response: Response
   try {
-    response = await fetch(url, { headers, signal: AbortSignal.timeout(5000) })
+    response = await serviceFetch(path, { config })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`OpenCode location request failed: ${message}`)
