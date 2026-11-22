@@ -371,30 +371,31 @@ export default Plugin.define({
         // Empty-prompt gesture. Base mode keeps it out of dialogs, autocomplete
         // and form modes; priority 2 beats the prompt layers (1) and the managed
         // textarea bindings. A non-empty prompt returns false so the event
-        // continues to the cursor/selection bindings untouched.
-        context.keymap.layer(() => ({
-          mode: "base",
-          priority: 2,
-          enabled: () =>
-            context.ui.router.current().type === "session" && context.renderer.currentFocusedEditor != null,
-          target: () => context.renderer.currentFocusedEditor,
-          commands: [
-            {
-              bind: "left,shift+left",
-              title: "Gangway sessions",
-              group: "Gangway",
-              run: () => {
-                const allowed = shouldOpenPanelOnLeft({
-                  routeType: context.ui.router.current().type,
-                  mode: context.keymap.mode.current(),
-                  editorText: context.renderer.currentFocusedEditor?.plainText ?? "",
-                })
-                if (!allowed) return false
-                openSessions()
-              },
-            },
-          ],
-        }))
+        // continues to the cursor/selection bindings untouched. Read the route
+        // in the factory body so navigation refreshes the layer; never attach a
+        // one-shot `target` accessor, which can be captured before the prompt
+        // editor exists.
+        const openOnEmptyLeft = () => {
+          const allowed = shouldOpenPanelOnLeft({
+            routeType: context.ui.router.current().type,
+            mode: context.keymap.mode.current(),
+            editorText: context.renderer.currentFocusedEditor?.plainText ?? "",
+          })
+          if (!allowed) return false
+          openSessions()
+        }
+        context.keymap.layer(() => {
+          const routeType = context.ui.router.current().type
+          return {
+            mode: "base",
+            priority: 2,
+            enabled: routeType === "session",
+            commands: [
+              { bind: "left", title: "Gangway sessions", group: "Gangway", run: openOnEmptyLeft },
+              { bind: "shift+left", title: "Gangway sessions", group: "Gangway", run: openOnEmptyLeft },
+            ],
+          }
+        })
         return null
       },
     })
