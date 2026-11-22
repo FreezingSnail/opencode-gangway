@@ -50,6 +50,22 @@ export function formatAge(updated: number, now: number = Date.now()): string {
   return `${date.getMonth() + 1}/${date.getDate()}`
 }
 
+export interface LeftPanelGestureInput {
+  readonly routeType: string
+  readonly mode: string
+  readonly editorText: string
+}
+
+/**
+ * The left-arrow panel gesture fires only where it cannot steal a real
+ * cursor/selection move: on a session route, in the base input mode (not
+ * modal, autocomplete or form modes), with an empty prompt. With text the
+ * gesture must fall through to the prompt's own binding.
+ */
+export function shouldOpenPanelOnLeft(input: LeftPanelGestureInput): boolean {
+  return input.routeType === "session" && input.mode === "base" && input.editorText === ""
+}
+
 export type GangwayFilter = "here" | "active" | "all"
 
 export const GANGWAY_FILTERS: readonly GangwayFilter[] = ["here", "active", "all"]

@@ -11,6 +11,7 @@ import {
   isGangwaySession,
   modelLabel,
   sessionGlyph,
+  shouldOpenPanelOnLeft,
   titleLabel,
   truncateHead,
   truncatePath,
@@ -338,6 +339,16 @@ export default Plugin.define({
       ),
     })
 
+    // Shared by the leader binding, palette, slash command and the empty-prompt
+    // left gesture: remember where to return, dismiss any dialog, open the page.
+    const openSessions = () => {
+      const current = context.ui.router.current()
+      if (current.type === "plugin" && current.name === PAGE) return
+      setPrevious({ ...current })
+      context.ui.dialog.clear()
+      context.ui.router.navigate({ type: "plugin", name: PAGE })
+    }
+
     // Global command layer: lives in the app slot so the binding, palette
     // entry and slash command stay available everywhere.
     const unregisterAppSlot = context.ui.slot({
@@ -353,12 +364,33 @@ export default Plugin.define({
               bind: "<leader>d",
               palette: true,
               slash: { name: "gangway", aliases: ["gangway-sessions"] },
+              run: openSessions,
+            },
+          ],
+        }))
+        // Empty-prompt gesture. Base mode keeps it out of dialogs, autocomplete
+        // and form modes; priority 2 beats the prompt layers (1) and the managed
+        // textarea bindings. A non-empty prompt returns false so the event
+        // continues to the cursor/selection bindings untouched.
+        context.keymap.layer(() => ({
+          mode: "base",
+          priority: 2,
+          enabled: () =>
+            context.ui.router.current().type === "session" && context.renderer.currentFocusedEditor != null,
+          target: () => context.renderer.currentFocusedEditor,
+          commands: [
+            {
+              bind: "left,shift+left",
+              title: "Gangway sessions",
+              group: "Gangway",
               run: () => {
-                const current = context.ui.router.current()
-                if (current.type === "plugin" && current.name === PAGE) return
-                setPrevious({ ...current })
-                context.ui.dialog.clear()
-                context.ui.router.navigate({ type: "plugin", name: PAGE })
+                const allowed = shouldOpenPanelOnLeft({
+                  routeType: context.ui.router.current().type,
+                  mode: context.keymap.mode.current(),
+                  editorText: context.renderer.currentFocusedEditor?.plainText ?? "",
+                })
+                if (!allowed) return false
+                openSessions()
               },
             },
           ],

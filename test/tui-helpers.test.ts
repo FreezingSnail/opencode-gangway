@@ -9,6 +9,7 @@ import {
   isGangwaySession,
   modelLabel,
   sessionGlyph,
+  shouldOpenPanelOnLeft,
   titleLabel,
   truncateHead,
   truncatePath,
@@ -122,6 +123,16 @@ test("sessionGlyph prioritizes attention over busy/idle", () => {
   expect(sessionGlyph("idle", { kind: "permission" })).toBe("!")
   expect(sessionGlyph("running", { kind: "question" })).toBe("?")
   expect(sessionGlyph("idle", { kind: "question" })).toBe("?")
+})
+
+test("shouldOpenPanelOnLeft requires a session route, base mode and an empty prompt", () => {
+  expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "base", editorText: "" })).toBe(true)
+  expect(shouldOpenPanelOnLeft({ routeType: "home", mode: "base", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "plugin", mode: "base", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "autocomplete", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "form", editorText: "" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "base", editorText: "hello" })).toBe(false)
+  expect(shouldOpenPanelOnLeft({ routeType: "session", mode: "base", editorText: " " })).toBe(false)
 })
 
 test("truncateHead and truncatePath keep content within bounds", () => {
