@@ -1,14 +1,18 @@
 import { expect, test } from "bun:test"
 import {
   applyGangwayFilter,
+  classifyNeedsInput,
+  countWaitingSessions,
   formatAge,
   hasGangwayMarker,
   isActiveSession,
   isGangwaySession,
   modelLabel,
+  sessionGlyph,
   titleLabel,
   truncateHead,
   truncatePath,
+  type NeedsInput,
 } from "../src/tui-helpers"
 import type { SessionInfo } from "@opencode/client"
 
@@ -80,9 +84,44 @@ test("formatAge buckets by age", () => {
   expect(formatAge(old.getTime(), now)).toBe(`${old.getMonth() + 1}/${old.getDate()}`)
 })
 
-test("isActiveSession counts only busy sessions as active", () => {
+test("isActiveSession counts busy sessions and unanswered prompts as active", () => {
   expect(isActiveSession("running")).toBe(true)
   expect(isActiveSession("idle")).toBe(false)
+  expect(isActiveSession("idle", { kind: "question" })).toBe(true)
+  expect(isActiveSession("idle", { kind: "permission" })).toBe(true)
+  expect(isActiveSession("running", { kind: "permission" })).toBe(true)
+})
+
+test("classifyNeedsInput treats unknown lists as no attention", () => {
+  expect(classifyNeedsInput({})).toBeUndefined()
+  expect(classifyNeedsInput({ permissions: undefined, forms: undefined })).toBeUndefined()
+  expect(classifyNeedsInput({ permissions: [], forms: [] })).toBeUndefined()
+  expect(classifyNeedsInput({ permissions: undefined, forms: [] })).toBeUndefined()
+  expect(classifyNeedsInput({ permissions: [], forms: undefined })).toBeUndefined()
+})
+
+test("classifyNeedsInput maps permission actions and forms", () => {
+  expect(classifyNeedsInput({ permissions: [{ action: "edit" }] })).toEqual({ kind: "permission" })
+  expect(classifyNeedsInput({ permissions: [{ action: "question" }] })).toEqual({ kind: "question" })
+  expect(classifyNeedsInput({ permissions: undefined, forms: [{}] })).toEqual({ kind: "question" })
+})
+
+test("classifyNeedsInput gives permission requests precedence over questions", () => {
+  expect(
+    classifyNeedsInput({ permissions: [{ action: "question" }, { action: "bash" }], forms: [{}] }),
+  ).toEqual({ kind: "permission" })
+  expect(classifyNeedsInput({ permissions: [{ action: "question" }], forms: [{}] })).toEqual({
+    kind: "question",
+  })
+})
+
+test("sessionGlyph prioritizes attention over busy/idle", () => {
+  expect(sessionGlyph("running")).toBe("▶")
+  expect(sessionGlyph("idle")).toBe("○")
+  expect(sessionGlyph("running", { kind: "permission" })).toBe("!")
+  expect(sessionGlyph("idle", { kind: "permission" })).toBe("!")
+  expect(sessionGlyph("running", { kind: "question" })).toBe("?")
+  expect(sessionGlyph("idle", { kind: "question" })).toBe("?")
 })
 
 test("truncateHead and truncatePath keep content within bounds", () => {
@@ -113,4 +152,61 @@ test("applyGangwayFilter evicts completed sessions from active views", () => {
     "a",
     "d",
   ])
+})
+
+test("applyGangwayFilter keeps waiting sessions and sorts them ahead of merely-running ones", () => {
+  const now = 1_000_000_000
+  const status: Record<string, "idle" | "running"> = {}
+  const attention: Record<string, NeedsInput | undefined> = {}
+  const mk = (id: string, directory: string, running: boolean, needs?: NeedsInput): SessionInfo => {
+    status[id] = running ? "running" : "idle"
+    attention[id] = needs
+    return makeSession({ id, location: { directory }, time: { created: now, updated: now } })
+  }
+  const busyHere = mk("a", "/work/foo", true)
+  const waitingHere = mk("b", "/work/foo", false, { kind: "question" })
+  const waitingElsewhere = mk("c", "/work/bar", false, { kind: "permission" })
+  const doneHere = mk("d", "/work/foo", false)
+  const busyElsewhere = mk("e", "/work/bar", true)
+  const sessions = [busyHere, waitingHere, waitingElsewhere, doneHere, busyElsewhere]
+
+  const options = {
+    directory: "/work/foo",
+    status: (s: SessionInfo) => status[s.id]!,
+    attention: (s: SessionInfo) => attention[s.id],
+  }
+  expect(applyGangwayFilter(sessions, "all", options).map((s) => s.id)).toEqual(["a", "b", "c", "d", "e"])
+  expect(applyGangwayFilter(sessions, "active", options).map((s) => s.id)).toEqual(["b", "c", "a", "e"])
+  expect(applyGangwayFilter(sessions, "here", options).map((s) => s.id)).toEqual(["b", "a"])
+  expect(applyGangwayFilter(sessions, "here", { ...options, directory: undefined }).map((s) => s.id)).toEqual([
+    "b",
+    "c",
+    "a",
+    "e",
+  ])
+})
+
+test("applyGangwayFilter treats unknown attention as idle", () => {
+  const now = 1_000_000_000
+  const idle = makeSession({ id: "a", time: { created: now, updated: now } })
+  const options = {
+    directory: idle.location.directory,
+    status: () => "idle" as const,
+    attention: () => undefined,
+  }
+  expect(applyGangwayFilter([idle], "active", options)).toEqual([])
+})
+
+test("countWaitingSessions counts only sessions with known attention", () => {
+  const a = makeSession({ id: "a" })
+  const b = makeSession({ id: "b" })
+  const c = makeSession({ id: "c" })
+  const attention: Record<string, NeedsInput | undefined> = {
+    a: { kind: "permission" },
+    b: undefined,
+    c: { kind: "question" },
+  }
+  expect(countWaitingSessions([a, b, c], (session) => attention[session.id])).toBe(2)
+  expect(countWaitingSessions([a, b, c], () => undefined)).toBe(0)
+  expect(countWaitingSessions([a, b, c], undefined)).toBe(0)
 })

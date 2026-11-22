@@ -1,17 +1,21 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { SessionInfo } from "@opencode/client"
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { For, Show, createMemo, createSignal, onMount } from "solid-js"
 import {
   GANGWAY_FILTERS,
   applyGangwayFilter,
+  classifyNeedsInput,
+  countWaitingSessions,
   formatAge,
   hasGangwayMarker,
   isGangwaySession,
   modelLabel,
+  sessionGlyph,
   titleLabel,
   truncateHead,
   truncatePath,
   type GangwayFilter,
+  type NeedsInput,
 } from "./tui-helpers"
 
 const PAGE = "gangway.sessions"
@@ -31,14 +35,55 @@ type SessionDataWithRemember = Plugin.Context["data"]["session"] & {
  * Hydrate gangway sessions from every location, not just the current one.
  * The store is populated by server events for anything created while the TUI
  * runs; this covers sessions created before the TUI (or while disconnected).
+ * Busy sessions with unsynced permission/form lists are synced once; the keys
+ * dedupe concurrent sweeps and defined lists are never refetched.
  */
+const attentionSyncs = new Map<string, Promise<void>>()
+
+async function syncAttention(context: Plugin.Context, sessions: readonly SessionInfo[] = context.data.session.list()) {
+  const tasks: Promise<void>[] = []
+  for (const session of sessions) {
+    if (!isGangwaySession(session) || session.parentID) continue
+    if (context.data.session.status(session.id) !== "running") continue
+
+    if (context.data.session.permission.list(session.id) === undefined) {
+      const key = `permission:${session.id}`
+      if (!attentionSyncs.has(key)) {
+        const task = context.data.session.permission
+          .sync(session.id)
+          .catch(() => {})
+          .finally(() => attentionSyncs.delete(key))
+        attentionSyncs.set(key, task)
+      }
+      const pending = attentionSyncs.get(key)
+      if (pending) tasks.push(pending)
+    }
+
+    if (context.data.session.form.list(session.id, session.location) === undefined) {
+      const key = `form:${session.id}:${session.location.directory}`
+      if (!attentionSyncs.has(key)) {
+        const task = context.data.session.form
+          .sync(session.id, session.location)
+          .catch(() => {})
+          .finally(() => attentionSyncs.delete(key))
+        attentionSyncs.set(key, task)
+      }
+      const pending = attentionSyncs.get(key)
+      if (pending) tasks.push(pending)
+    }
+  }
+  await Promise.all(tasks)
+}
+
 async function hydrate(context: Plugin.Context) {
+  let listed: readonly SessionInfo[] = []
   try {
     const response = await context.client.session.list({
       parentID: null,
       limit: LIST_LIMIT,
       order: "desc",
     })
+    listed = response.data
     for (const info of response.data) {
       if (!isGangwaySession(info)) continue
       if (!context.data.session.get(info.id)) (context.data.session as SessionDataWithRemember).remember(info)
@@ -46,6 +91,7 @@ async function hydrate(context: Plugin.Context) {
   } catch {
     // Transient transport failure: events still keep the list live.
   }
+  await syncAttention(context, [...listed, ...context.data.session.list()])
 }
 
 const FILTER_LABEL: Record<GangwayFilter, string> = { here: "here", active: "active", all: "all" }
@@ -69,16 +115,30 @@ function SessionsPage(props: {
     context.data.session.list().filter((session) => isGangwaySession(session) && !session.parentID),
   )
   const statusOf = (session: SessionInfo) => context.data.session.status(session.id)
+  const attentionOf = (session: SessionInfo): NeedsInput | undefined =>
+    classifyNeedsInput({
+      permissions: context.data.session.permission.list(session.id),
+      forms: context.data.session.form.list(session.id, session.location),
+    })
 
   const counts = createMemo(() => {
     const result: Record<GangwayFilter, number> = { here: 0, active: 0, all: 0 }
     for (const filter of GANGWAY_FILTERS)
-      result[filter] = applyGangwayFilter(sessions(), filter, { directory: directory(), status: statusOf }).length
+      result[filter] = applyGangwayFilter(sessions(), filter, {
+        directory: directory(),
+        status: statusOf,
+        attention: attentionOf,
+      }).length
     return result
   })
   const visible = createMemo(() =>
-    applyGangwayFilter(sessions(), props.filter(), { directory: directory(), status: statusOf }),
+    applyGangwayFilter(sessions(), props.filter(), {
+      directory: directory(),
+      status: statusOf,
+      attention: attentionOf,
+    }),
   )
+  const waiting = createMemo(() => countWaitingSessions(visible(), attentionOf))
   const selectedIndex = createMemo(() => Math.min(selected(), Math.max(0, visible().length - 1)))
 
   const switchFilter = (filter: GangwayFilter) => {
@@ -89,8 +149,6 @@ function SessionsPage(props: {
 
   onMount(() => {
     void hydrate(context)
-    const interval = setInterval(() => void hydrate(context), REFRESH_MS)
-    onCleanup(() => clearInterval(interval))
   })
 
   const open = (session: SessionInfo) => {
@@ -160,9 +218,14 @@ function SessionsPage(props: {
         paddingRight={2}
         paddingTop={1}
       >
-        <text fg={theme.text.base}>
-          <b>Gangway sessions</b>
-        </text>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme.text.base}>
+            <b>Gangway sessions</b>
+          </text>
+          <Show when={waiting() > 0}>
+            <text fg={theme.text.feedback.warning.base}>{`· ${waiting()} waiting`}</text>
+          </Show>
+        </box>
         <box flexDirection="row" gap={2}>
           <For each={GANGWAY_FILTERS}>
             {(filter, index) => {
@@ -185,6 +248,13 @@ function SessionsPage(props: {
           <For each={visible()}>
             {(session, index) => {
               const running = () => statusOf(session) === "running"
+              const attention = () => attentionOf(session)
+              const glyphColor = () => {
+                const needs = attention()
+                if (needs?.kind === "permission") return theme.text.feedback.warning.base
+                if (needs?.kind === "question") return theme.hue.accent[200]
+                return running() ? theme.text.feedback.info.base : theme.text.muted
+              }
               const active = () => index() === selectedIndex()
               return (
                 <box
@@ -196,9 +266,7 @@ function SessionsPage(props: {
                   backgroundColor={active() ? theme.background.raised.high : undefined}
                 >
                   <box width={2} flexShrink={0}>
-                    <text fg={running() ? theme.text.feedback.info.base : theme.text.muted}>
-                      {running() ? "▶" : "○"}
-                    </text>
+                    <text fg={glyphColor()}>{sessionGlyph(statusOf(session), attention())}</text>
                   </box>
                   <box flexGrow={1} minWidth={0} flexShrink={1}>
                     <text fg={theme.text.base}>{titleLabel(session)}</text>
@@ -221,7 +289,9 @@ function SessionsPage(props: {
         </Show>
       </scrollbox>
       <box flexShrink={0} paddingLeft={2} paddingRight={2} paddingBottom={1}>
-        <text fg={theme.text.muted}>1/2/3 filter · j/k move · enter open · i interrupt · r refresh · esc back</text>
+        <text fg={theme.text.muted}>
+          {`${waiting() > 0 ? `${waiting()} waiting · ` : ""}1/2/3 filter · j/k move · enter open · i interrupt · r refresh · esc back`}
+        </text>
       </box>
     </box>
   )
@@ -251,8 +321,10 @@ export default Plugin.define({
     })
 
     // Hydrate immediately so the footer counter and the panel are correct
-    // from plugin load, even when no server event has been seen yet.
+    // from plugin load, even when no server event has been seen yet. The sweep
+    // also resolves unknown permission/form lists for busy sessions.
     void hydrate(context)
+    const interval = setInterval(() => void hydrate(context), REFRESH_MS)
 
     const unregisterRoute = context.ui.router.register({
       name: PAGE,
@@ -298,10 +370,16 @@ export default Plugin.define({
     const unregisterStatus = context.ui.slot({
       append: "home.footer.status",
       render: () => {
-        const count = createMemo(() => context.data.session.list().filter(isGangwaySession).length)
+        const sessions = createMemo(() => context.data.session.list().filter(isGangwaySession))
+        const attentionOf = (session: SessionInfo) =>
+          classifyNeedsInput({
+            permissions: context.data.session.permission.list(session.id),
+            forms: context.data.session.form.list(session.id, session.location),
+          })
+        const waiting = createMemo(() => countWaitingSessions(sessions(), attentionOf))
         return (
-          <Show when={count() > 0}>
-            <text fg={context.theme.text.muted}>{`gangway ${count()}`}</text>
+          <Show when={sessions().length > 0}>
+            <text fg={context.theme.text.muted}>{`gangway ${sessions().length}${waiting() > 0 ? ` · ${waiting()} waiting` : ""}`}</text>
           </Show>
         )
       },
@@ -316,11 +394,61 @@ export default Plugin.define({
       })
     })
 
+    // One toast per pending prompt id; cleared when the prompt is answered or
+    // cancelled so a re-issued id can announce again. Display only: replies
+    // stay with the user.
+    const seenPermissions = new Set<string>()
+    const seenForms = new Set<string>()
+
+    const stopPermissionAsked = context.data.on("permission.asked", (event) => {
+      if (seenPermissions.has(event.data.id)) return
+      const session = context.data.session.get(event.data.sessionID)
+      if (!session || !hasGangwayMarker(session)) return
+      seenPermissions.add(event.data.id)
+      context.ui.toast.show({
+        sessionID: event.data.sessionID,
+        message:
+          event.data.action === "question" ? "Gangway session needs an answer" : "Gangway session needs permission",
+        variant: "warning",
+      })
+    })
+
+    const stopPermissionReplied = context.data.on("permission.replied", (event) => {
+      seenPermissions.delete(event.data.requestID)
+    })
+
+    const stopFormCreated = context.data.on("form.created", (event) => {
+      if (event.data.form.sessionID === "global") return
+      if (seenForms.has(event.data.form.id)) return
+      const session = context.data.session.get(event.data.form.sessionID)
+      if (!session || !hasGangwayMarker(session)) return
+      seenForms.add(event.data.form.id)
+      context.ui.toast.show({
+        sessionID: event.data.form.sessionID,
+        message: "Gangway session has a question",
+        variant: "warning",
+      })
+    })
+
+    const stopFormReplied = context.data.on("form.replied", (event) => {
+      seenForms.delete(event.data.id)
+    })
+
+    const stopFormCancelled = context.data.on("form.cancelled", (event) => {
+      seenForms.delete(event.data.id)
+    })
+
     return () => {
+      clearInterval(interval)
       unregisterRoute()
       unregisterAppSlot()
       unregisterStatus()
       stopCreated()
+      stopPermissionAsked()
+      stopPermissionReplied()
+      stopFormCreated()
+      stopFormReplied()
+      stopFormCancelled()
     }
   },
 })

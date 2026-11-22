@@ -130,19 +130,24 @@ Gangway ships a TUI plugin (`./tui` entry, `gangway.tui`) with a live sessions p
 - **Open with `ctrl+x d`** (`<leader>d`, configurable as `gangway.sessions` in keybinds), the
   command palette ("Gangway sessions"), or the `/gangway` slash command.
 - Lists gangway sessions: `[gangway]`/`metadata.gangway`-marked roots (plus legacy
-  `[codex]`/`codexMcp` sessions) only, newest first, with model, age, directory and a live busy
-  indicator.
-- **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — busy sessions in
-  the current directory (default), `active` — busy sessions in every directory, `all` —
-  every gangway session. Completed sessions leave the active views as soon as they go idle;
-  `all` keeps the history. The filter persists
+  `[codex]`/`codexMcp` sessions) only, newest first, with model, age, directory and a live state
+  indicator. The glyph is `!` for a pending permission request, `?` for a pending question
+  form, `▶` while busy and `○` when idle. Waiting sessions sort ahead of merely-busy ones in
+  `here`/`active`, and the header/footer show a waiting count (for example `2 waiting`).
+- **Three filters, switched with `1`/`2`/`3` or the header tabs:** `here` — busy or waiting
+  sessions in the current directory (default), `active` — busy or waiting sessions in every
+  directory, `all` — every gangway session. Completed sessions leave the active views as soon
+  as they go idle and stop waiting; `all` keeps the history. The filter persists
   across panel opens (plugin storage). Tab labels show live counts.
-- **Updates live** — new sessions, titles, and busy/idle state are projected from server events
-  through the shared data store, no manual refresh. Historical sessions from other directories
-  are hydrated at startup and on a 5 s fallback sweep; the page also handles `r`.
+- **Updates live** — new sessions, titles, busy/idle state and pending permissions/forms are
+  projected from server events through the shared data store, no manual refresh. Historical
+  sessions from other directories are hydrated at startup and on a 5 s fallback sweep (which
+  also syncs unknown permission/form lists for busy sessions); the page also handles `r`.
 - `enter` opens the session, `i` interrupts it, `j`/`k` move selection, `esc` returns.
-- The home footer shows a `gangway N` counter, and a toast announces each new gangway session
-  (with an Open action).
+- The home footer shows a `gangway N` counter (plus `· M waiting` when sessions need input), and
+  a toast announces each new gangway session, pending permission request and question form
+  (one toast per request/form, cleared when answered or cancelled). Toasts are display-only:
+  gangway never answers permissions or forms for you.
 
 Sessions are recognized by the neutral `metadata.gangway` marker or `[gangway]` title prefix.
 Legacy sessions from earlier bridge versions are still recognized by `metadata.codexMcp` or the
