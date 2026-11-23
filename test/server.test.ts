@@ -101,6 +101,19 @@ describe("per-request context resolution", () => {
       expect(seen.every((value) => value === directory)).toBe(true)
 
       seen.length = 0
+      await post(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "opencode_delivery",
+          arguments: { requestID: "existing-operation", action: "inspect", directory },
+        },
+      }))
+      expect(seen[0]).toBe(directory)
+      expect(seen.every((value) => value === directory)).toBe(true)
+
+      seen.length = 0
       await post("{not-json")
       expect(seen).toEqual([])
 

@@ -104,11 +104,67 @@ function payload(result: any): any {
   return JSON.parse(textOf(result))
 }
 
-async function statusTitle(url: string): Promise<string> {
-  const result = await callTool(url, "opencode_status", { sessionID: "ses_example" })
+async function statusTitle(url: string, directory?: string): Promise<string> {
+  const result = await callTool(url, "opencode_status", {
+    sessionID: "ses_example",
+    ...(directory ? { directory } : {}),
+  })
   expect(result.isError).not.toBe(true)
   return payload(result).title
 }
+
+test("status directory hint selects and reacquires the exact location", async () => {
+  const root = mkdtempSync(join(tmpdir(), "gangway-status-location-"))
+  const firstDirectory = join(root, "first")
+  const requestedDirectory = join(root, "requested")
+  const rendezvous = join(root, "endpoint.json")
+  mkdirSync(firstDirectory)
+  mkdirSync(requestedDirectory)
+  let info: EndpointInfo | undefined
+  let first: (() => void) | undefined
+  let requested: (() => void) | undefined
+  let revived: (() => void) | undefined
+  const ensureCalls: string[] = []
+  const ensure = async (directory: string) => {
+    ensureCalls.push(directory)
+    revived ??= acquireEndpoint({
+      port: info!.port,
+      rendezvous,
+      ctx: context("requested-revived", requestedDirectory),
+      pluginOptions: {},
+      ensureLocation: ensure,
+    })
+  }
+  try {
+    first = acquireEndpoint({
+      port: 0,
+      rendezvous,
+      ctx: context("first", firstDirectory),
+      pluginOptions: {},
+      ensureLocation: ensure,
+    })
+    info = infoAt(rendezvous)
+    requested = acquireEndpoint({
+      port: info.port,
+      rendezvous,
+      ctx: context("requested", requestedDirectory),
+      pluginOptions: {},
+      ensureLocation: ensure,
+    })
+
+    expect(await statusTitle(info.url, requestedDirectory)).toBe("requested")
+    requested()
+    requested = undefined
+    expect(await statusTitle(info.url, requestedDirectory)).toBe("requested-revived")
+    expect(ensureCalls).toEqual([requestedDirectory])
+  } finally {
+    first?.()
+    requested?.()
+    revived?.()
+    shutdownEndpoints()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test("final owner unload keeps the endpoint and reacquires a live context", async () => {
   const root = mkdtempSync(join(tmpdir(), "gangway-lifecycle-"))

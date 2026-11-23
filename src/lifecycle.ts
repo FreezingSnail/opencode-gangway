@@ -103,6 +103,7 @@ function findInstance(endpoint: Endpoint, requested?: string): Instance | undefi
       const directory = instance.ctx.location?.directory
       if (typeof directory === "string" && canonicalDirectory(directory) === wanted) return instance
     }
+    return undefined
   }
   return live[0]
 }

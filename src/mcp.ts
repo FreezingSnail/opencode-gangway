@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
-import { registerBridgeTools, type Ctx } from "./tools"
+import { codexDeliveryEnabled, registerBridgeTools, type Ctx } from "./tools"
+import type { DeliveryTransport } from "./codex-delivery"
 
 export const DEFAULT_PORT = 4787
 
@@ -25,6 +26,9 @@ export interface StartOptions {
   hostname?: string
   ctx?: Ctx
   pluginOptions?: Record<string, unknown>
+  // Test seam for the operator retry path. Plugin runtime uses the default
+  // Codex App Server transport.
+  deliveryTransport?: DeliveryTransport
   // Resolve the current plugin owner when each request arrives. Async resolvers
   // may boot/reacquire an OpenCode location; throwing is treated like "no current
   // context" so ping still answers and tools can retry lazily.
@@ -39,7 +43,8 @@ interface RequestHint {
   // A real tool call (not ping, initialize, or tools/list) may need a live
   // location. Health checks must not boot an idle location as a side effect.
   resolve: boolean
-  // Only `opencode_start_session` carries a directory that may need booting.
+  // Any real tool call can explicitly target a location. Start and status
+  // calls both use this to avoid resolving against an unrelated live location.
   directory?: string
 }
 
@@ -58,7 +63,6 @@ async function requestHint(request: Request): Promise<RequestHint> {
       const params = call.params as { name?: unknown; arguments?: unknown }
       if (typeof params.name !== "string" || params.name === "opencode_ping") continue
       resolve = true
-      if (params.name !== "opencode_start_session") continue
       if (!params.arguments || typeof params.arguments !== "object") continue
       const candidate = (params.arguments as { directory?: unknown }).directory
       if (typeof candidate === "string" && candidate) directory = candidate
@@ -102,7 +106,7 @@ function lazyContext(
         if (!resolved?.ctx) {
           throw contextUnavailable(
             new Error(
-              "no live context is available; pass opencode_start_session arguments.directory or open a project",
+              "no live context is available; pass a tool's directory argument or open a project",
             ),
             requested,
           )
@@ -151,7 +155,11 @@ function lazyContext(
   }
 }
 
-function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown>): McpServer {
+function buildServer(
+  ctx: Ctx | undefined,
+  pluginOptions: Record<string, unknown>,
+  deliveryTransport?: DeliveryTransport,
+): McpServer {
   const server = new McpServer({ name: "gangway", version: "0.2.0" })
 
   server.registerTool(
@@ -173,7 +181,9 @@ function buildServer(ctx: Ctx | undefined, pluginOptions: Record<string, unknown
     registerBridgeTools(server, ctx, {
       defaultWaitMs: configured,
       inheritPermissions: pluginOptions.inheritPermissions === true,
+      codexDelivery: codexDeliveryEnabled(pluginOptions),
       ...(titlePrefix ? { titlePrefix } : {}),
+      ...(deliveryTransport ? { deliveryTransport } : {}),
     })
   }
 
@@ -214,7 +224,7 @@ export function startMcpServer(options: StartOptions = {}): McpServerHandle {
         (options.context ? lazyContext(options.context, options.knownDirectory, hint.directory) : undefined)
 
       // Stateless mode: fresh server + transport per request.
-      const server = buildServer(ctx, current?.pluginOptions ?? pluginOptions)
+      const server = buildServer(ctx, current?.pluginOptions ?? pluginOptions, options.deliveryTransport)
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

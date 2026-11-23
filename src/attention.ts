@@ -8,6 +8,10 @@ import type { Ctx } from "./tools"
 
 export interface PermissionRequestInfo {
   id: string | null
+  /** Internal event/queue identity used when OpenCode omits the permission id. */
+  sourceEventID?: string | null
+  /** Event identities already merged into a queue-first observation. */
+  sourceEventIDs?: string[]
   action: string | null
   resources: unknown
   message: string | null
@@ -15,6 +19,10 @@ export interface PermissionRequestInfo {
 
 export interface FormInfo {
   id: string | null
+  /** Internal event/queue identity used when OpenCode omits the form id. */
+  sourceEventID?: string | null
+  /** Event identities already merged into a queue-first observation. */
+  sourceEventIDs?: string[]
   title: string | null
 }
 
@@ -24,9 +32,23 @@ export interface NeedsInput {
   forms: FormInfo[]
 }
 
-interface ProbeSource {
-  permission: unknown[] | null
-  form: unknown[] | null
+export interface NeedsInputProbe {
+  /** null means the queue could not be read; [] is a known-empty queue. */
+  permission: PermissionRequestInfo[] | null
+  /** null means the queue could not be read; [] is a known-empty queue. */
+  forms: FormInfo[] | null
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(label + " timed out after " + timeoutMs + "ms")), timeoutMs)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 function canonicalDirectory(directory: string): string {
@@ -110,8 +132,10 @@ async function probeForm(
 
 function permissionInfo(entry: unknown): PermissionRequestInfo {
   const item = entry as Record<string, unknown> | null | undefined
+  const sourceEventID = queueIdentity(item)
   return {
     id: typeof item?.id === "string" ? item.id : null,
+    ...(sourceEventID ? { sourceEventID } : {}),
     action: typeof item?.action === "string" ? item.action : null,
     resources: item?.resources ?? null,
     message: typeof item?.message === "string" ? item.message : null,
@@ -120,16 +144,43 @@ function permissionInfo(entry: unknown): PermissionRequestInfo {
 
 function formInfo(entry: unknown): FormInfo {
   const item = entry as Record<string, unknown> | null | undefined
+  const sourceEventID = queueIdentity(item)
   return {
     id: typeof item?.id === "string" ? item.id : null,
+    ...(sourceEventID ? { sourceEventID } : {}),
     title: typeof item?.title === "string" ? item.title : null,
   }
 }
 
-function classify(source: ProbeSource): NeedsInput | null {
-  if (source.permission === null && source.form === null) return null
-  const requests = (source.permission ?? []).map(permissionInfo)
-  const forms = (source.form ?? []).map(formInfo)
+// The queue APIs usually provide an upstream id. Some hosts omit it while
+// retaining a stable timestamp or sequence on the pending item. Preserve that
+// identity so a later same-shape request is not hidden by durable dedupe.
+function queueIdentity(item: Record<string, unknown> | null | undefined): string | null {
+  if (!item) return null
+  const time = item.time && typeof item.time === "object"
+    ? item.time as Record<string, unknown>
+    : null
+  for (const [field, value] of [
+    ["sequence", item.sequence],
+    ["seq", item.seq],
+    ["createdAt", item.createdAt],
+    ["created", item.created],
+    ["timestamp", item.timestamp],
+    ["time.created", time?.created],
+    ["time.createdAt", time?.createdAt],
+  ] as const) {
+    if ((typeof value === "string" && value.length > 0) ||
+        (typeof value === "number" && Number.isFinite(value))) {
+      return `queue:${field}:${String(value)}`
+    }
+  }
+  return null
+}
+
+function classify(source: NeedsInputProbe): NeedsInput | null {
+  if (source.permission === null && source.forms === null) return null
+  const requests = source.permission ?? []
+  const forms = source.forms ?? []
   if (requests.length === 0 && forms.length === 0) return null
 
   // A pending `question` permission is the same stall as a pending form; both
@@ -152,7 +203,22 @@ export async function detectNeedsInput(
   ctx: Ctx,
   sessionID: string,
   directory?: string | null,
+  timeoutMs = 5_000,
 ): Promise<NeedsInput | null> {
+  return classify(await probeNeedsInput(ctx, sessionID, directory, timeoutMs))
+}
+
+/**
+ * Probe each queue independently. Unknown (null) remains distinct from a
+ * known-empty list so reconciliation can preserve event state on probe failure
+ * and clear stale queue observations when an empty queue is confirmed.
+ */
+export async function probeNeedsInput(
+  ctx: Ctx,
+  sessionID: string,
+  directory?: string | null,
+  timeoutMs = 5_000,
+): Promise<NeedsInputProbe> {
   let target = typeof directory === "string" && directory ? directory : undefined
   if (!target) {
     try {
@@ -167,8 +233,11 @@ export async function detectNeedsInput(
   const local = useLocalInstances(ctx, target)
 
   const [permission, form] = await Promise.all([
-    probePermission(ctx, sessionID, target, local),
-    probeForm(ctx, sessionID, target, local),
+    withTimeout(probePermission(ctx, sessionID, target, local), timeoutMs, "permission queue").catch(() => null),
+    withTimeout(probeForm(ctx, sessionID, target, local), timeoutMs, "form queue").catch(() => null),
   ])
-  return classify({ permission, form })
+  return {
+    permission: permission?.map(permissionInfo) ?? null,
+    forms: form?.map(formInfo) ?? null,
+  }
 }

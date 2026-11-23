@@ -1,6 +1,13 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import { detectNeedsInput, type NeedsInput } from "./attention"
+import {
+  cachedCodexTarget,
+  codexReadinessFor,
+  CODEX_TARGET_READINESS_TTL_MS,
+  verifyCodexTarget,
+} from "./codex-readiness"
+import type { DeliveryTransport } from "./codex-delivery"
 
 export const TAG = "[gangway]"
 export const DEFAULT_MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-flash" }
@@ -11,6 +18,7 @@ export const DEFAULT_MODEL = { providerID: "opencode-go", id: "deepseek-v4.1-fla
 export const CLIENT_REQUEST_LIMIT_MS = 60_000
 export const DEFAULT_WAIT_MS = 45_000
 export const DEFAULT_MAX_CHARS = 20_000
+export const DEFAULT_PROBE_TIMEOUT_MS = 5_000
 
 // Unattended sessions cannot answer permission prompts, so the bridge installs a
 // session-scoped ruleset at create time. It mirrors the user's global policy, but
@@ -72,6 +80,11 @@ export interface Ctx {
   }
   form?: {
     list(input: { sessionID: string }): Promise<unknown>
+  }
+  // Server event stream installed by the plugin API. Optional so tool-only
+  // callers and older hosts keep working; the execution monitor is additive.
+  event?: {
+    subscribe(options?: { signal?: AbortSignal }): AsyncIterable<unknown>
   }
 }
 
@@ -246,7 +259,7 @@ function reply(payload: unknown) {
 // endpoint-owner handover serialize against the same requestID.
 // ---------------------------------------------------------------------------
 
-type Identity = {
+export type Identity = {
   kind: "start" | "prompt"
   directory: string | null
   model: string | null
@@ -255,7 +268,7 @@ type Identity = {
   prompt: string
 }
 
-type OperationState =
+export type OperationState =
   | "intent" // intent recorded, upstream effect not yet attempted (or unknown)
   | "created" // session id known and recorded, prompt not submitted
   | "submitting" // prompt submission attempted; delivery unknown if interrupted here
@@ -264,7 +277,7 @@ type OperationState =
   | "failed"
   | "unknown"
 
-interface Completion {
+export interface Completion {
   text: string
   model: unknown
   cost: unknown
@@ -277,7 +290,29 @@ interface Completion {
   completedAt: number | null
 }
 
-interface OperationRecord {
+export type CodexDeliveryStatus =
+  | "sending"
+  | "accepted"
+  | "preflight-failed"
+  | "rejected"
+  | "ambiguous"
+
+export interface CodexDeliveryEventState {
+  key: string
+  status: CodexDeliveryStatus
+  threadId: string
+  recipientThreadId: string | null
+  attemptedAt: number
+  acceptedAt: number | null
+  turnId: string | null
+  error: string | null
+}
+
+export interface CodexDeliveryState {
+  events: Record<string, CodexDeliveryEventState>
+}
+
+export interface OperationRecord {
   requestID: string
   kind: "start" | "prompt"
   identity: Identity
@@ -297,6 +332,56 @@ interface OperationRecord {
   lastOutputId: string | null
   error: string | null
   warnings?: string[]
+  // Server-event recording (gangway-34r.1). Optional so records written by an
+  // older build stay readable and writable.
+  admittedAt?: number | null
+  executionStartedAt?: number | null
+  attention?: NeedsInput | null
+  streamText?: string | null
+  streamKey?: string | null
+  streamMessageID?: string | null
+  streamCost?: unknown
+  streamTokens?: unknown
+  streamFinish?: unknown
+  terminalEventId?: string | null
+  terminalSource?: "event" | "transcript" | null
+  // Codex caller/thread metadata supplied by the MCP transport (`_meta.threadId`)
+  // on the dispatch call. This is the owning thread, not the OpenCode session.
+  codexThreadId?: string | null
+  // Public per-dispatch opt-in (gangway-34r.3). Absent/false preserves the
+  // original request/response behavior: no push notification is attempted.
+  notify?: boolean
+  // Location whose live monitor owns push readiness. Prompt operations have no
+  // identity directory, so the dispatching instance records it explicitly.
+  notifyDirectory?: string | null
+  // Durable per-outcome notification state (gangway-34r.2). Optional so records
+  // written by an older build remain readable.
+  codexDelivery?: CodexDeliveryState | null
+}
+
+const CODEX_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Read the Codex thread id the App Server attaches to MCP tool calls. */
+export function codexThreadIdFromMeta(meta: unknown): string | null {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null
+  const candidate = (meta as Record<string, unknown>).threadId
+  if (typeof candidate !== "string") return null
+  const threadId = candidate.trim().toLowerCase()
+  return CODEX_THREAD_ID.test(threadId) ? threadId : null
+}
+
+/**
+ * Deployment gate for outcome push. The per-dispatch `notify` flag also has to
+ * be set; this only enables the monitor/transport. `GANGWAY_CODEX_DELIVERY=1`
+ * is the environment fallback for installs that cannot pass plugin options.
+ */
+export function codexDeliveryEnabled(options: Record<string, unknown> | undefined): boolean {
+  const configured = options?.codexDelivery
+  if (configured === true) return true
+  if (configured && typeof configured === "object" && !Array.isArray(configured)) {
+    if ((configured as { enabled?: unknown }).enabled === true) return true
+  }
+  return process.env.GANGWAY_CODEX_DELIVERY === "1"
 }
 
 const locksKey = Symbol.for("gangway.operation-locks.v1")
@@ -305,7 +390,7 @@ const globalLocks = globalThis as typeof globalThis & {
 }
 const operationLocks = globalLocks[locksKey] ??= new Map<string, Promise<unknown>>()
 
-async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+export async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const previous = operationLocks.get(key) ?? Promise.resolve()
   let release!: () => void
   const gate = new Promise<void>((resolve) => (release = resolve))
@@ -330,13 +415,13 @@ function identityHash(identity: Identity): string {
   return hashString(JSON.stringify(identity))
 }
 
-async function loadOperation(ctx: Ctx, requestID: string): Promise<OperationRecord | null> {
+export async function loadOperation(ctx: Ctx, requestID: string): Promise<OperationRecord | null> {
   const raw = await ctx.storage.get(operationKey(requestID))
   if (raw && typeof raw === "object") return raw as OperationRecord
   return null
 }
 
-async function saveOperation(ctx: Ctx, op: OperationRecord): Promise<void> {
+export async function saveOperation(ctx: Ctx, op: OperationRecord): Promise<void> {
   op.updatedAt = Date.now()
   await ctx.storage.set(operationKey(op.requestID), op)
 }
@@ -375,10 +460,25 @@ function newOperation(
     completion: null,
     lastOutputId: null,
     error: null,
+    admittedAt: null,
+    executionStartedAt: null,
+    attention: null,
+    streamText: null,
+    streamKey: null,
+    streamMessageID: null,
+    streamCost: null,
+    streamTokens: null,
+    streamFinish: null,
+    terminalEventId: null,
+    terminalSource: null,
+    codexThreadId: null,
+    notify: false,
+    notifyDirectory: null,
+    codexDelivery: null,
   }
 }
 
-function isTerminal(op: OperationRecord): boolean {
+export function isTerminal(op: OperationRecord): boolean {
   return op.state === "completed" || op.state === "failed"
 }
 
@@ -389,19 +489,20 @@ function stateStatus(op: OperationRecord): string {
   return "pending"
 }
 
-function toCompletion(message: any, outcome: string | null, tail: any): Completion {
+export function toCompletion(message: any, outcome: string | null, tail: any): Completion {
   const content: any[] = Array.isArray(message?.content) ? message.content : []
   return {
     text: content
       .filter((part) => part?.type === "text")
       .map((part) => part.text ?? "")
       .join("\n")
-      .trim(),
+      .trim()
+      .slice(0, DEFAULT_MAX_CHARS),
     model: message?.model ?? null,
     cost: message?.cost ?? null,
     tokens: message?.tokens ?? null,
     finish: message?.finish ?? null,
-    error: message?.error ?? null,
+    error: message?.error ?? tail?.error ?? null,
     outcome,
     messageID: typeof message?.id === "string" ? message.id : null,
     outputId: outputIdOf(message, tail) ?? "message@?@?",
@@ -409,7 +510,7 @@ function toCompletion(message: any, outcome: string | null, tail: any): Completi
   }
 }
 
-interface Probe {
+export interface Probe {
   status: "completed" | "failed" | "running"
   completion?: Completion
   freshCount: number
@@ -418,8 +519,13 @@ interface Probe {
 // Turn binding: only messages appended after the recorded boundary count, and a
 // trailing idle message, can complete the operation. A prior assistant answer or
 // an idle that predates submission is invisible here.
-async function probeTranscript(ctx: Ctx, sessionID: string, boundary: number | null): Promise<Probe> {
-  const messages = await transcript(ctx, sessionID)
+export async function probeTranscript(
+  ctx: Ctx,
+  sessionID: string,
+  boundary: number | null,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+): Promise<Probe> {
+  const messages = await withTimeout(transcript(ctx, sessionID), timeoutMs)
   const start = boundary ?? messages.length
   const fresh = messages.slice(start)
   const freshCount = fresh.length
@@ -429,7 +535,7 @@ async function probeTranscript(ctx: Ctx, sessionID: string, boundary: number | n
   if (last && tail?.type === "idle") {
     const outcome: string | null = tail.outcome ?? null
     return {
-      status: outcome === "failed" ? "failed" : "completed",
+      status: outcome === "failed" || outcome === "interrupted" ? "failed" : "completed",
       completion: toCompletion(last, outcome, tail),
       freshCount,
     }
@@ -439,32 +545,133 @@ async function probeTranscript(ctx: Ctx, sessionID: string, boundary: number | n
 
 // Reconcile a durable operation against upstream state. Never resends or
 // recreates: it only observes and advances the recorded state.
-async function reconcileOperation(ctx: Ctx, op: OperationRecord): Promise<OperationRecord> {
+export async function reconcileOperation(
+  ctx: Ctx,
+  op: OperationRecord,
+  onTransientError?: (error: unknown) => void,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+): Promise<OperationRecord> {
   if (isTerminal(op) || op.sessionID == null || op.boundary == null) return op
   let probe: Probe
   try {
-    probe = await probeTranscript(ctx, op.sessionID, op.boundary)
-  } catch {
+    probe = await probeTranscript(ctx, op.sessionID, op.boundary, timeoutMs)
+  } catch (error) {
     // Transient upstream read failure: keep the recorded state, do not flip it.
+    onTransientError?.(error)
     return op
   }
   if (probe.status === "completed" || probe.status === "failed") {
     op.state = probe.status
     op.completion = probe.completion ?? null
     op.error = null
+    op.attention = null
+    op.terminalSource ??= "transcript"
   } else if (op.delivery === "unknown" && probe.freshCount > 0) {
     // Reconciliation found our turn admitted upstream, so delivery is no longer
     // ambiguous. The turn may still be running.
     op.delivery = "recorded"
     op.state = "submitted"
     op.error = null
+    op.admittedAt ??= op.submittedAt ?? Date.now()
   }
   await saveOperation(ctx, op)
   return op
 }
 
-function operationSummary(op: OperationRecord, extra: Record<string, unknown> = {}) {
+function deliveryAttempts(op: OperationRecord) {
+  const events = op.codexDelivery?.events
+  if (!events) return null
+  const attempts = Object.entries(events).map(([outputId, event]) => ({
+    outputId,
+    status: event.status,
+    recipientThreadId: event.recipientThreadId,
+    turnId: event.turnId,
+    attemptedAt: event.attemptedAt,
+    acceptedAt: event.acceptedAt,
+    error: event.error,
+  }))
+  return attempts.length ? attempts : null
+}
+
+// Dispatch contract returned to opted-in callers. The state is computed from the
+// live monitor readiness published by the plugin instance plus the caller
+// identity captured from `_meta.threadId`; static plugin options are only the
+// fallback when no runtime record exists. The delivery attempts are the durable
+// per-outputId records users inspect by requestID when a push fails.
+function notificationFields(op: OperationRecord, codexDelivery: boolean) {
+  const attempts = deliveryAttempts(op)
+  if (op.notify !== true) return attempts ? { codexDeliveries: attempts } : {}
+  const threadId = op.codexThreadId ?? null
+  const directory = op.notifyDirectory ?? op.identity.directory
+  const runtime = codexReadinessFor(directory)
+  const enabled = runtime?.deliveryEnabled ?? codexDelivery
+  const target = cachedCodexTarget(directory, threadId)
+  const state = !enabled
+    ? "plugin-disabled"
+    : !op.sessionID
+      ? "session-unavailable"
+    : !threadId
+      ? "thread-missing"
+      : !runtime || !runtime.monitorAvailable
+        ? "monitor-unavailable"
+        : target?.status === "unavailable"
+          ? "target-unavailable"
+            : target?.status !== "available"
+              ? "target-unverified"
+              : "armed"
+  const hint =
+    state === "plugin-disabled"
+      ? "Codex push is disabled for this location. Set the codexDelivery plugin option (or GANGWAY_CODEX_DELIVERY=1) and reload before dispatch."
+      : state === "session-unavailable"
+        ? "OpenCode did not confirm a session ID for this operation, so no terminal outcome can be monitored. Inspect the recorded operation before relying on push."
+      : state === "thread-missing"
+        ? "No Codex _meta.threadId was supplied. Codex sends it automatically; other MCP clients cannot receive this push."
+        : state === "monitor-unavailable"
+          ? "The Codex push monitor is not subscribed for this location, so no run outcome can be pushed. Use opencode_wait/opencode_result, or restore the event stream and reload."
+          : state === "target-unavailable"
+            ? "The calling Codex thread is not loaded on the shared App Server. Load it (and any required parent) before relying on the push; the recorded result remains available through opencode_result."
+          : state === "target-unverified"
+            ? "Gangway has not verified that the calling Codex thread is loaded on the shared App Server. Keep this turn open and inspect status, or reconnect the shared App Server before relying on push."
+            : "End this turn after the receipt. One structured result is pushed to the bound Codex thread on completion; do not resubmit or poll."
   return {
+    notify: {
+      requested: true,
+      state,
+      mechanism: "codex-push",
+      threadId,
+      monitor: runtime
+        ? { available: runtime.monitorAvailable, error: runtime.monitorError }
+        : null,
+      target: {
+        state: target?.status ?? "unchecked",
+        checkedAt: target?.checkedAt ?? null,
+        error: target?.error ?? null,
+      },
+      ...(attempts ? { deliveries: attempts } : {}),
+      hint,
+    },
+  }
+}
+
+// Receipt-time target probe. Only the live plugin installs a verifier; direct
+// tool/test contexts keep the static fallback. Failures are cached and reflected
+// as `target-unavailable` instead of claiming an armed receipt.
+async function verifyNotificationTarget(op: OperationRecord, codexDelivery: boolean): Promise<void> {
+  if (op.notify !== true || !op.sessionID || !op.codexThreadId) return
+  const directory = op.notifyDirectory ?? op.identity.directory
+  const runtime = codexReadinessFor(directory)
+  const enabled = runtime?.deliveryEnabled ?? codexDelivery
+  if (!enabled || !runtime?.monitorAvailable) return
+  const cached = cachedCodexTarget(directory, op.codexThreadId)
+  if (cached && Date.now() - cached.checkedAt <= CODEX_TARGET_READINESS_TTL_MS) return
+  await verifyCodexTarget(directory, op.codexThreadId)
+}
+
+function operationSummary(
+  op: OperationRecord,
+  extra: Record<string, unknown> = {},
+  codexDelivery = false,
+) {  return {
     requestID: op.requestID,
     sessionID: op.sessionID,
     kind: op.kind,
@@ -476,15 +683,16 @@ function operationSummary(op: OperationRecord, extra: Record<string, unknown> = 
     boundary: op.boundary,
     outputId: op.completion?.outputId ?? null,
     error: op.error,
+    ...notificationFields(op, codexDelivery),
     ...(op.warnings?.length ? { warnings: op.warnings } : {}),
     ...extra,
   }
 }
 
-function completionSummary(op: OperationRecord) {
+function completionSummary(op: OperationRecord, codexDelivery = false) {
   const c = op.completion
   return {
-    ...operationSummary(op),
+    ...operationSummary(op, {}, codexDelivery),
     outputId: c?.outputId ?? null,
     text: c?.text ?? null,
     model: c?.model ?? null,
@@ -504,6 +712,17 @@ async function submitPrompt(ctx: Ctx, op: OperationRecord, text: string): Promis
   // explicitly unknown; a later retry must reconcile, never blind-resend.
   op.state = "submitting"
   op.delivery = "pending"
+  op.admittedAt = null
+  op.executionStartedAt = null
+  op.attention = null
+  op.streamText = null
+  op.streamKey = null
+  op.streamMessageID = null
+  op.streamCost = null
+  op.streamTokens = null
+  op.streamFinish = null
+  op.terminalEventId = null
+  op.terminalSource = null
   await saveOperation(ctx, op)
   try {
     const inbox: any = await ctx.session.prompt({ sessionID: op.sessionID, text })
@@ -536,8 +755,14 @@ async function waitForCompletion(
     detectNeedsInput(ctx, sessionID, directory ?? start.identity.directory)
   let op = start
   for (;;) {
-    op = await reconcileOperation(ctx, op)
+    op = await withLock(op.requestID, async () => {
+      const current = await loadOperation(ctx, op.requestID)
+      return current ? reconcileOperation(ctx, current) : op
+    })
     if (isTerminal(op)) return { op, needsInput: null }
+    // Event-recorded attention is a positive observation even when a later live
+    // probe is unavailable. It is cleared by the matching reply/cancel event.
+    if (op.attention) return { op, needsInput: op.attention }
     // A stalled session does not advance its transcript. Report the stall now
     // instead of waiting out the caller's budget; operation state is untouched,
     // so a later wait resumes normally once the user answers in the TUI.
@@ -611,6 +836,8 @@ async function prepareStart(
     directory?: string
     agent?: string
     model?: { providerID: string; id: string }
+    codexThreadId?: string | null
+    notify?: boolean
   },
   permissions: Array<{ action: string; resource: string; effect: string }> | undefined,
   titlePrefix: string,
@@ -633,12 +860,40 @@ async function prepareStart(
     if (!op) {
       // Intent precedes any effectful upstream call.
       op = newOperation(requestID, "start", identity, hash, args.sessionID ?? null)
+      op.codexThreadId = args.codexThreadId ?? null
+      op.notify = args.notify === true
+      op.notifyDirectory = directory
       await saveOperation(ctx, op)
+    } else {
+      // Bind the owning Codex thread to the first dispatch that supplied it.
+      // Later retries may fill it in, but never replace it.
+      if (args.codexThreadId && !op.codexThreadId) {
+        op.codexThreadId = args.codexThreadId
+        await saveOperationSafe(ctx, op)
+      }
+      if (op.notifyDirectory == null) {
+        op.notifyDirectory = directory
+        await saveOperationSafe(ctx, op)
+      }
     }
 
     if (existing) {
       op = await reconcileOperation(ctx, op)
-      if (isTerminal(op)) return { op }
+      if (isTerminal(op)) {
+        if (args.notify === true && op.notify !== true) {
+          throw new Error(
+            `requestID "${requestID}" already finished without notify; the recorded result is inspectable with opencode_result. ` +
+              "Use a new dispatch with notify=true to receive a push.",
+          )
+        }
+        return { op }
+      }
+      // Notification is deployment behavior, not part of the pinned input
+      // identity: a retry may arm it before completion, but never disarms it.
+      if (args.notify === true && op.notify !== true) {
+        op.notify = true
+        await saveOperationSafe(ctx, op)
+      }
       // A previous attempt never observed a create result: the session may or may
       // not exist. Do not create again; report unknown until reconciliation.
       if (op.sessionID == null) {
@@ -698,7 +953,7 @@ async function prepareStart(
 async function preparePrompt(
   ctx: Ctx,
   requestID: string,
-  args: { sessionID: string; text: string },
+  args: { sessionID: string; text: string; codexThreadId?: string | null; notify?: boolean },
 ): Promise<DispatchResult> {
   const identity: Identity = {
     kind: "prompt",
@@ -715,11 +970,35 @@ async function preparePrompt(
     let op = existing
     if (!op) {
       op = newOperation(requestID, "prompt", identity, hash, args.sessionID)
+      op.codexThreadId = args.codexThreadId ?? null
+      op.notify = args.notify === true
+      op.notifyDirectory = ctx.location?.directory ?? null
       await saveOperation(ctx, op)
+    } else {
+      if (args.codexThreadId && !op.codexThreadId) {
+        op.codexThreadId = args.codexThreadId
+        await saveOperationSafe(ctx, op)
+      }
+      if (op.notifyDirectory == null && ctx.location?.directory) {
+        op.notifyDirectory = ctx.location.directory
+        await saveOperationSafe(ctx, op)
+      }
     }
     if (existing) {
       op = await reconcileOperation(ctx, op)
-      if (isTerminal(op)) return { op }
+      if (isTerminal(op)) {
+        if (args.notify === true && op.notify !== true) {
+          throw new Error(
+            `requestID "${requestID}" already finished without notify; the recorded result is inspectable with opencode_result. ` +
+              "Use a new dispatch with notify=true to receive a push.",
+          )
+        }
+        return { op }
+      }
+      if (args.notify === true && op.notify !== true) {
+        op.notify = true
+        await saveOperationSafe(ctx, op)
+      }
     }
     if (op.state === "intent" || op.state === "created") {
       op = await submitPrompt(ctx, op, args.text)
@@ -734,7 +1013,12 @@ function attentionFields(needsInput: NeedsInput) {
   return { needsInput, waitResult: "needs-input", timedOut: false }
 }
 
-function statusPayload(op: OperationRecord, info: Record<string, any>, needsInput: NeedsInput | null) {
+function statusPayload(
+  op: OperationRecord,
+  info: Record<string, any>,
+  needsInput: NeedsInput | null,
+  codexDelivery = false,
+) {
   return {
     requestID: op.requestID,
     sessionID: op.sessionID,
@@ -749,6 +1033,7 @@ function statusPayload(op: OperationRecord, info: Record<string, any>, needsInpu
     completed: isTerminal(op),
     error: op.error,
     needsInput,
+    ...notificationFields(op, codexDelivery),
     ...(op.warnings?.length ? { warnings: op.warnings } : {}),
     session: {
       title: info.title ?? null,
@@ -766,17 +1051,26 @@ function statusPayload(op: OperationRecord, info: Record<string, any>, needsInpu
 export function registerBridgeTools(
   server: McpServer,
   ctx: Ctx,
-  options: { defaultWaitMs?: number; inheritPermissions?: boolean; titlePrefix?: string } = {},
+  options: {
+    defaultWaitMs?: number
+    inheritPermissions?: boolean
+    titlePrefix?: string
+    codexDelivery?: boolean
+    // Test seam for opencode_delivery retry; plugin runtime uses the default
+    // App Server transport.
+    deliveryTransport?: DeliveryTransport
+  } = {},
 ) {
   const defaultWaitMs = options.defaultWaitMs ?? DEFAULT_WAIT_MS
   const titlePrefix = options.titlePrefix ?? TAG
   const permissions = options.inheritPermissions ? undefined : unattendedRuleset()
+  const codexDelivery = options.codexDelivery ?? codexDeliveryEnabled(ctx.options)
 
   server.registerTool(
     "opencode_start_session",
     {
       description:
-        "Start an OpenCode implementation session (defaults to model opencode-go/deepseek-v4.1-flash) and send it an initial prompt. Returns the session ID; pass wait=true to block until the run finishes. Pass a requestID to make dispatch idempotent and resumable.",
+        "Start an OpenCode implementation session (defaults to model opencode-go/deepseek-v4.1-flash) and send it an initial prompt. Returns immediately with a stable requestID/sessionID receipt. Pass requestID for idempotent, resumable dispatch; set notify=true to opt in to one Codex push of the structured result when the run finishes (requires requestID; the calling Codex thread is captured automatically). After an armed receipt the caller may end its turn: do not resubmit or poll. wait=true blocks as before.",
       inputSchema: {
         prompt: z.string().describe("Implementation task for the OpenCode session"),
         sessionID: z.string().optional().describe("Attach to an existing session instead of creating one"),
@@ -789,11 +1083,21 @@ export function registerBridgeTools(
         requestID: z
           .string()
           .optional()
-          .describe("Idempotency key; identical retries resolve to the same recorded operation"),
+          .describe("Stable idempotency key; identical retries resolve to the same recorded operation"),
+        notify: z
+          .boolean()
+          .optional()
+          .describe(
+            "Opt in to one Codex push of the eventual structured result. Requires requestID; receipt reports whether session, monitor, and thread are ready",
+          ),
       },
     },
-    async (args) => {
+    async (args, extra) => {
+      if (args.notify && !args.requestID) {
+        throw new Error("notify requires a stable requestID so the result can be pushed once")
+      }
       const model = args.sessionID ? null : parseModel(args.model)
+      const codexThreadId = codexThreadIdFromMeta(extra?._meta)
 
       if (!args.requestID) {
         if (args.sessionID) {
@@ -857,18 +1161,21 @@ export function registerBridgeTools(
           directory: args.directory,
           agent: args.agent,
           model: model ?? undefined,
+          codexThreadId,
+          notify: args.notify === true,
         },
         permissions,
         titlePrefix,
         defaultWaitMs,
       )
-      if (!args.wait) return reply({ ...operationSummary(op), worstCaseWaitMs: defaultWaitMs })
+      await verifyNotificationTarget(op, codexDelivery)
+      if (!args.wait) return reply({ ...operationSummary(op, {}, codexDelivery), worstCaseWaitMs: defaultWaitMs })
       const outcome = isTerminal(op)
         ? { op, needsInput: null }
         : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
-      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
-      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
-      return reply(operationSummary(outcome.op, { timedOut: true, reason: reason ?? "wait-expired" }))
+      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput), codexDelivery))
+      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op, codexDelivery))
+      return reply(operationSummary(outcome.op, { timedOut: true, reason: reason ?? "wait-expired" }, codexDelivery))
     },
   )
 
@@ -876,7 +1183,7 @@ export function registerBridgeTools(
     "opencode_prompt",
     {
       description:
-        "Send a follow-up prompt to an existing OpenCode session. Pass a requestID to make dispatch idempotent and resumable.",
+        "Send a follow-up prompt to an existing OpenCode session. Pass requestID for idempotent, resumable dispatch; set notify=true to opt in to one Codex push of the structured result when this turn finishes (requires requestID). After an armed receipt the caller may end its turn: do not resubmit or poll.",
       inputSchema: {
         sessionID: z.string().describe("Session ID (ses_...)"),
         text: z.string(),
@@ -885,10 +1192,20 @@ export function registerBridgeTools(
         requestID: z
           .string()
           .optional()
-          .describe("Idempotency key; identical retries resolve to the same recorded operation"),
+          .describe("Stable idempotency key; identical retries resolve to the same recorded operation"),
+        notify: z
+          .boolean()
+          .optional()
+          .describe(
+            "Opt in to one Codex push of the eventual structured result. Requires requestID; receipt reports whether session, monitor, and thread are ready",
+          ),
       },
     },
-    async (args) => {
+    async (args, extra) => {
+      if (args.notify && !args.requestID) {
+        throw new Error("notify requires a stable requestID so the result can be pushed once")
+      }
+      const codexThreadId = codexThreadIdFromMeta(extra?._meta)
       if (!args.requestID) {
         await ctx.session.get({ sessionID: args.sessionID })
         await ctx.session.prompt({ sessionID: args.sessionID, text: args.text })
@@ -908,14 +1225,20 @@ export function registerBridgeTools(
 
       requireStorage(ctx)
       await ctx.session.get({ sessionID: args.sessionID })
-      const { op } = await preparePrompt(ctx, args.requestID, { sessionID: args.sessionID, text: args.text })
-      if (!args.wait) return reply({ ...operationSummary(op), worstCaseWaitMs: defaultWaitMs })
+      const { op } = await preparePrompt(ctx, args.requestID, {
+        sessionID: args.sessionID,
+        text: args.text,
+        codexThreadId,
+        notify: args.notify === true,
+      })
+      await verifyNotificationTarget(op, codexDelivery)
+      if (!args.wait) return reply({ ...operationSummary(op, {}, codexDelivery), worstCaseWaitMs: defaultWaitMs })
       const outcome = isTerminal(op)
         ? { op, needsInput: null }
         : await waitForCompletion(ctx, op, args.timeoutMs ?? defaultWaitMs)
-      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
-      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
-      return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }))
+      if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput), codexDelivery))
+      if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op, codexDelivery))
+      return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }, codexDelivery))
     },
   )
 
@@ -936,12 +1259,15 @@ export function registerBridgeTools(
         if (!op) {
           return reply({ requestID: args.requestID, sessionID: args.sessionID, status: "unknown", state: "unknown", error: "unknown requestID" })
         }
-        const reconciled = await reconcileOperation(ctx, op)
-        if (isTerminal(reconciled)) return reply(completionSummary(reconciled))
+        const reconciled = await withLock(args.requestID, async () => {
+          const current = await loadOperation(ctx, args.requestID!)
+          return current ? reconcileOperation(ctx, current) : op
+        })
+        if (isTerminal(reconciled)) return reply(completionSummary(reconciled, codexDelivery))
         const outcome = await waitForCompletion(ctx, reconciled, args.timeoutMs ?? defaultWaitMs)
-        if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput)))
-        if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op))
-        return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }))
+        if (outcome.needsInput) return reply(operationSummary(outcome.op, attentionFields(outcome.needsInput), codexDelivery))
+        if (isTerminal(outcome.op)) return reply(completionSummary(outcome.op, codexDelivery))
+        return reply(operationSummary(outcome.op, { timedOut: true, reason: "wait-expired" }, codexDelivery))
       }
       const outcome = await waitForIdle(ctx, args.sessionID, args.timeoutMs ?? defaultWaitMs)
       const latest = await lastAssistant(ctx, args.sessionID)
@@ -956,9 +1282,10 @@ export function registerBridgeTools(
     "opencode_status",
     {
       description:
-        "Report an OpenCode session's state. With requestID returns compact recorded operation state (no transcript fetch unless reconcile=true). Without requestID returns session info plus a tail of the latest assistant output.",
+        "Report an OpenCode session's state. With requestID returns compact recorded operation state (no transcript fetch unless reconcile=true), including the notify contract and durable codex delivery attempts. Without requestID returns session info plus a tail of the latest assistant output.",
       inputSchema: {
         sessionID: z.string(),
+        directory: z.string().optional().describe("Resolve this status request against this project location"),
         requestID: z.string().optional().describe("Return compact state for a recorded operation"),
         reconcile: z.boolean().optional().describe("With requestID: also probe the transcript to advance incomplete state"),
       },
@@ -981,12 +1308,13 @@ export function registerBridgeTools(
             })
           }
           if (args.reconcile) op = await reconcileOperation(ctx, op)
+          await verifyNotificationTarget(op, codexDelivery)
           // Stalls are only meaningful while the turn is nonterminal; a finished
           // operation reports `needsInput: null` explicitly.
           const needsInput = isTerminal(op)
             ? null
-            : await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
-          return reply(statusPayload(op, info, needsInput))
+            : op.attention ?? await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
+          return reply(statusPayload(op, info, needsInput, codexDelivery))
         })
       }
 
@@ -1012,7 +1340,7 @@ export function registerBridgeTools(
     "opencode_result",
     {
       description:
-        "Return bounded assistant output. With requestID returns the recorded operation's own result and reports unchanged output instead of resending it (pass force=true to resend).",
+        "Return bounded assistant output. With requestID returns the recorded operation's own result and reports unchanged output instead of resending it (pass force=true to resend). The same response includes notify/codex delivery state, so a failed push can be inspected without resubmitting the run.",
       inputSchema: {
         sessionID: z.string(),
         maxChars: z.number().int().positive().optional().describe("Defaults to 20000"),
@@ -1030,11 +1358,12 @@ export function registerBridgeTools(
             return reply({ requestID: args.requestID, sessionID: args.sessionID, state: "unknown", status: "unknown", unchanged: false, error: "unknown requestID" })
           }
           const op = await reconcileOperation(ctx, loaded)
+          await verifyNotificationTarget(op, codexDelivery)
           if (!isTerminal(op) || !op.completion) {
             const needsInput = isTerminal(op)
               ? null
-              : await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
-            return reply(operationSummary(op, { unchanged: false, needsInput }))
+              : op.attention ?? await detectNeedsInput(ctx, op.sessionID ?? args.sessionID, op.identity.directory)
+            return reply(operationSummary(op, { unchanged: false, needsInput }, codexDelivery))
           }
           const c = op.completion
           const unchanged = args.force !== true && op.lastOutputId === c.outputId
@@ -1058,6 +1387,7 @@ export function registerBridgeTools(
             tokens: c.tokens,
             cost: c.cost,
             error: c.error,
+            ...notificationFields(op, codexDelivery),
           })
         })
       }
@@ -1075,6 +1405,81 @@ export function registerBridgeTools(
         tokens: latest.tokens,
         cost: latest.cost,
         error: latest.error,
+      })
+    },
+  )
+
+  server.registerTool(
+    "opencode_delivery",
+    {
+      description:
+        "Inspect or deliberately recover Codex push delivery for a recorded requestID. action=inspect (default) is read-only. action=deliver sends a first terminal result only when that output has no prior delivery record. action=retry resends only known preflight failures; accepted, rejected, sending and ambiguous entries are never resent. action=recover marks stale sending reservations ambiguous without sending a duplicate turn/start. Use directory to select the operation's location.",
+      inputSchema: {
+        requestID: z.string().describe("Recorded operation requestID"),
+        directory: z.string().optional().describe("Resolve this recovery request against the operation's project location"),
+        sessionID: z.string().optional().describe("Optional session check"),
+        action: z
+          .enum(["inspect", "deliver", "retry", "recover"])
+          .optional()
+          .describe("inspect (default), deliver a missing first result, retry preflight failures, or recover stale sending"),
+        outputId: z.string().optional().describe("Expected result outputId or delivery key"),
+      },
+    },
+    async (args) => {
+      if (!ctx.storage || typeof ctx.storage.get !== "function") {
+        throw new Error("requestID delivery inspection requires plugin storage")
+      }
+      const loaded = await loadOperation(ctx, args.requestID)
+      if (!loaded) {
+        return reply({
+          requestID: args.requestID,
+          state: "unknown",
+          status: "unknown",
+          error: "unknown requestID",
+        })
+      }
+      if (args.sessionID && loaded.sessionID !== args.sessionID) {
+        return reply({
+          requestID: args.requestID,
+          sessionID: args.sessionID,
+          state: "unknown",
+          status: "unknown",
+          error: "requestID is bound to a different session",
+        })
+      }
+      const action = args.action ?? "inspect"
+      let retries: unknown
+      let delivered: unknown
+      let recovered: unknown
+      if (action !== "inspect") {
+        const delivery = await import("./codex-delivery")
+        const transport = options.deliveryTransport
+        if (action === "deliver") {
+          delivered = await delivery.deliverFirstRecordedOperation(
+            ctx,
+            args.requestID,
+            args.outputId,
+            transport ? { transport } : {},
+          )
+        } else if (action === "retry") {
+          retries = await delivery.retryRecordedDeliveries(ctx, args.requestID, {
+            ...(args.outputId ? { key: args.outputId } : {}),
+            ...(transport ? { transport } : {}),
+          })
+        } else {
+          recovered = await delivery.recoverStaleSending(ctx, args.requestID, {
+            ...(args.outputId ? { key: args.outputId } : {}),
+          })
+        }
+      }
+      const op = await loadOperation(ctx, args.requestID) ?? loaded
+      await verifyNotificationTarget(op, codexDelivery)
+      return reply({
+        ...operationSummary(op, {}, codexDelivery),
+        deliveryAction: action,
+        ...(delivered ? { delivered } : {}),
+        ...(retries ? { retries } : {}),
+        ...(recovered ? { recovered } : {}),
       })
     },
   )

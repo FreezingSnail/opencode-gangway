@@ -1,8 +1,13 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { startMcpServer, type McpServerHandle } from "../src/mcp"
-import type { Ctx } from "../src/tools"
+import { loadOperation, saveOperation, type Ctx } from "../src/tools"
+import type { DeliveryTransport } from "../src/codex-delivery"
+import {
+  clearCodexReadiness,
+  setCodexReadiness,
+} from "../src/codex-readiness"
 
 // Focused, deterministic, offline tests for reliable dispatch/resume
 // (gangway-5ti). A fake OpenCode context stands in for the real plugin context:
@@ -204,15 +209,21 @@ interface Harness {
 function harness(options: {
   backend?: Backend
   pluginOptions?: Record<string, unknown>
+  deliveryTransport?: DeliveryTransport
 } = {}): Harness {
   const backend = options.backend ?? new Backend()
   const server = startMcpServer({
     port: 0,
     ctx: backend.context(),
     pluginOptions: options.pluginOptions ?? {},
+    ...(options.deliveryTransport ? { deliveryTransport: options.deliveryTransport } : {}),
   })
   return { backend, server }
 }
+
+afterEach(() => {
+  clearCodexReadiness("/repo")
+})
 
 type ToolResult = { content?: Array<{ type: string; text?: string }>; isError?: boolean }
 
@@ -227,11 +238,20 @@ function payload(result: unknown): any {
   return JSON.parse(textOf(result))
 }
 
-async function callTool(server: McpServerHandle, name: string, args: Record<string, unknown>): Promise<ToolResult> {
+async function callTool(
+  server: McpServerHandle,
+  name: string,
+  args: Record<string, unknown>,
+  meta?: Record<string, unknown>,
+): Promise<ToolResult> {
   const client = new Client({ name: "gangway-dispatch-test", version: "0.0.1" })
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${server.port}/mcp`)))
   try {
-    return (await client.callTool({ name, arguments: args })) as ToolResult
+    return (await client.callTool({
+      name,
+      arguments: args,
+      ...(meta ? { _meta: meta } : {}),
+    })) as ToolResult
   } finally {
     await client.close()
   }
@@ -298,6 +318,528 @@ describe("idempotent dispatch (requestID)", () => {
   })
 })
 
+describe("public Codex push contract", () => {
+  const threadId = crypto.randomUUID()
+
+  test("notify without a stable requestID is rejected before any dispatch", async () => {
+    const { backend, server } = harness({ pluginOptions: { codexDelivery: true } })
+    try {
+      const result = await callTool(
+        server,
+        "opencode_start_session",
+        { prompt: "task", notify: true },
+        { threadId },
+      )
+      expect(result.isError).toBe(true)
+      expect(textOf(result)).toContain("notify requires a stable requestID")
+      expect(backend.createAttempts).toBe(0)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("an armed receipt returns immediately with the bound thread and no-poll instruction", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+        verifyTarget: async () => {},
+      })
+      const started = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "long task", requestID: "req-push-armed", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(started.sessionID).toStartWith("ses_")
+      expect(started.state).not.toBe("completed")
+      expect(started.notify).toMatchObject({
+        requested: true,
+        state: "armed",
+        mechanism: "codex-push",
+        threadId,
+      })
+      expect(started.notify.hint).toContain("End this turn")
+      expect(started.notify.hint).toContain("do not resubmit or poll")
+
+      const record = await loadOperation(backend.context(), "req-push-armed")
+      expect(record?.notify).toBe(true)
+      expect(record?.codexThreadId).toBe(threadId)
+      expect(backend.createAttempts).toBe(1)
+      expect(backend.promptCalls.length).toBe(1)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("opencode_prompt exposes the same notify contract", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    const seed = backend.seedSession({ title: "existing" })
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+        verifyTarget: async () => {},
+      })
+      const receipt = payload(
+        await callTool(
+          server,
+          "opencode_prompt",
+          { sessionID: seed.id, text: "follow up", requestID: "req-prompt-push", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(receipt.kind).toBe("prompt")
+      expect(receipt.notify).toMatchObject({ requested: true, state: "armed", threadId })
+      expect(backend.createAttempts).toBe(0)
+      expect(backend.promptCalls.length).toBe(1)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("receipts are actionable when push is disabled or the caller thread is unavailable", async () => {
+    const disabled = harness()
+    try {
+      const off = payload(
+        await callTool(
+          disabled.server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-push-off", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(off.notify.state).toBe("plugin-disabled")
+      expect(off.notify.hint).toContain("codexDelivery")
+    } finally {
+      disabled.server.stop()
+    }
+
+    const enabled = harness({ pluginOptions: { codexDelivery: true } })
+    try {
+      const unbound = payload(
+        await callTool(enabled.server, "opencode_start_session", {
+          prompt: "task",
+          requestID: "req-push-unbound",
+          wait: false,
+          notify: true,
+        }),
+      )
+      expect(unbound.sessionID).toStartWith("ses_")
+      expect(unbound.notify.state).toBe("thread-missing")
+      expect(unbound.notify.threadId).toBeNull()
+      expect(unbound.notify.hint).toContain("_meta.threadId")
+    } finally {
+      enabled.server.stop()
+    }
+  })
+
+  test("static enablement without a live monitor cannot claim that push is armed", async () => {
+    const backend = new Backend()
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      const receipt = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-push-no-monitor", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(receipt.notify.state).toBe("monitor-unavailable")
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("status and result expose durable delivery attempts by requestID without resubmitting", async () => {
+    const backend = new Backend()
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      const started = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-push-inspect", wait: true, notify: true },
+          { threadId },
+        ),
+      )
+      expect(started.state).toBe("completed")
+
+      const ctx = backend.context()
+      const record = await loadOperation(ctx, "req-push-inspect")
+      await saveOperation(ctx, {
+        ...record!,
+        codexDelivery: {
+          events: {
+            "msg_out": {
+              key: "msg_out",
+              status: "preflight-failed",
+              threadId,
+              recipientThreadId: threadId,
+              attemptedAt: 1,
+              acceptedAt: null,
+              turnId: null,
+              error: "Codex thread is not loaded",
+            },
+          },
+        },
+      })
+
+      const status = payload(
+        await callTool(server, "opencode_status", {
+          sessionID: started.sessionID,
+          requestID: "req-push-inspect",
+        }),
+      )
+      expect(status.notify.deliveries).toHaveLength(1)
+      expect(status.notify.deliveries[0]).toMatchObject({
+        outputId: "msg_out",
+        status: "preflight-failed",
+        error: "Codex thread is not loaded",
+      })
+
+      const result = payload(
+        await callTool(server, "opencode_result", {
+          sessionID: started.sessionID,
+          requestID: "req-push-inspect",
+          force: true,
+        }),
+      )
+      expect(result.notify.deliveries[0].status).toBe("preflight-failed")
+      expect(backend.promptCalls.length).toBe(1) // inspection never resubmits
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("receipt readiness reflects the live monitor and App Server target, not stale options", async () => {
+    const backend = new Backend()
+    backend.autoComplete = false
+    // Static per-location options are stale/off; the live plugin readiness is on.
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: false } })
+    let checks = 0
+    try {
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+        verifyTarget: async () => {
+          checks += 1
+        },
+      })
+      const armed = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-ready-armed", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(armed.notify).toMatchObject({
+        state: "armed",
+        monitor: { available: true },
+        target: { state: "available" },
+      })
+      expect(checks).toBe(1)
+
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+        verifyTarget: async () => {
+          throw new Error("thread is not loaded")
+        },
+      })
+      const unavailable = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-ready-target", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(unavailable.notify.state).toBe("target-unavailable")
+      expect(unavailable.notify.target.error).toContain("not loaded")
+
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: false,
+        monitorError: "stream unavailable",
+        verifyTarget: async () => {},
+      })
+      const noMonitor = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-ready-monitor", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(noMonitor.notify.state).toBe("monitor-unavailable")
+      expect(noMonitor.notify.monitor).toMatchObject({ available: false, error: "stream unavailable" })
+
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+      })
+      const unchecked = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-ready-unverified", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(unchecked.notify.state).toBe("target-unverified")
+
+      setCodexReadiness("/repo", {
+        deliveryEnabled: false,
+        monitorAvailable: true,
+        monitorError: null,
+      })
+      const disabled = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-ready-disabled", wait: false, notify: true },
+          { threadId },
+        ),
+      )
+      expect(disabled.notify.state).toBe("plugin-disabled")
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("opencode_delivery retries only known preflight failures", async () => {
+    const backend = new Backend()
+    const sent: string[] = []
+    const transport: DeliveryTransport = {
+      async send({ payload }) {
+        sent.push(payload.kind)
+        return { recipientThreadId: threadId, turnId: "turn_retry" }
+      },
+    }
+    const { server } = harness({
+      backend,
+      pluginOptions: { codexDelivery: true },
+      deliveryTransport: transport,
+    })
+    try {
+      const started = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-delivery-retry", wait: true, notify: true },
+          { threadId },
+        ),
+      )
+      expect(started.state).toBe("completed")
+      const ctx = backend.context()
+      const record = await loadOperation(ctx, "req-delivery-retry")
+      const key = record?.completion?.outputId ?? "missing"
+      await saveOperation(ctx, {
+        ...record!,
+        codexDelivery: {
+          events: {
+            [key]: {
+              key,
+              status: "preflight-failed",
+              threadId,
+              recipientThreadId: threadId,
+              attemptedAt: 1,
+              acceptedAt: null,
+              turnId: null,
+              error: "initialize failed",
+            },
+          },
+        },
+      })
+
+      const retried = payload(
+        await callTool(server, "opencode_delivery", {
+          sessionID: started.sessionID,
+          requestID: "req-delivery-retry",
+          action: "retry",
+        }),
+      )
+      expect(retried.deliveryAction).toBe("retry")
+      expect(retried.retries[0]).toMatchObject({ status: "accepted" })
+      expect(retried.notify.deliveries[0].status).toBe("accepted")
+      expect(backend.promptCalls.length).toBe(1)
+      expect(sent).toEqual(["gangway.operation.result"])
+
+      const repeated = payload(
+        await callTool(server, "opencode_delivery", {
+          sessionID: started.sessionID,
+          requestID: "req-delivery-retry",
+          action: "retry",
+        }),
+      )
+      expect(repeated.retries[0]).toMatchObject({ status: "skipped", reason: "no-preflight-failures" })
+      expect(sent).toHaveLength(1)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("opencode_delivery can send a missing first result exactly once", async () => {
+    const backend = new Backend()
+    const sent: string[] = []
+    const transport: DeliveryTransport = {
+      async send({ payload }) {
+        sent.push(payload.kind)
+        return { recipientThreadId: threadId, turnId: "turn_first_delivery" }
+      },
+    }
+    const { server } = harness({
+      backend,
+      pluginOptions: { codexDelivery: true },
+      deliveryTransport: transport,
+    })
+    try {
+      const started = payload(await callTool(
+        server,
+        "opencode_start_session",
+        { prompt: "task", requestID: "req-first-delivery", wait: false, notify: true },
+        { threadId },
+      ))
+      const completed = payload(await callTool(server, "opencode_status", {
+        sessionID: started.sessionID,
+        requestID: "req-first-delivery",
+        reconcile: true,
+      }))
+
+      const delivered = payload(await callTool(server, "opencode_delivery", {
+        requestID: "req-first-delivery",
+        sessionID: started.sessionID,
+        directory: "/repo",
+        action: "deliver",
+        outputId: completed.outputId,
+      }))
+      expect(delivered.delivered).toMatchObject({ status: "accepted", key: completed.outputId })
+      expect(sent).toEqual(["gangway.operation.result"])
+
+      const repeated = payload(await callTool(server, "opencode_delivery", {
+        requestID: "req-first-delivery",
+        directory: "/repo",
+        action: "deliver",
+      }))
+      expect(repeated.delivered).toMatchObject({ status: "skipped", reason: "already-accepted" })
+      expect(sent).toHaveLength(1)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("opencode_delivery recovers a stale sending reservation without sending", async () => {
+    const backend = new Backend()
+    let sends = 0
+    const transport: DeliveryTransport = {
+      async send() {
+        sends += 1
+        return { recipientThreadId: threadId, turnId: "turn_never" }
+      },
+    }
+    const { server } = harness({
+      backend,
+      pluginOptions: { codexDelivery: true },
+      deliveryTransport: transport,
+    })
+    try {
+      const started = payload(
+        await callTool(
+          server,
+          "opencode_start_session",
+          { prompt: "task", requestID: "req-delivery-stale", wait: true, notify: true },
+          { threadId },
+        ),
+      )
+      const ctx = backend.context()
+      const record = await loadOperation(ctx, "req-delivery-stale")
+      const key = record?.completion?.outputId ?? "missing"
+      await saveOperation(ctx, {
+        ...record!,
+        codexDelivery: {
+          events: {
+            [key]: {
+              key,
+              status: "sending",
+              threadId,
+              recipientThreadId: null,
+              attemptedAt: Date.now() - 120_000,
+              acceptedAt: null,
+              turnId: null,
+              error: null,
+            },
+          },
+        },
+      })
+
+      const recovered = payload(
+        await callTool(server, "opencode_delivery", {
+          sessionID: started.sessionID,
+          requestID: "req-delivery-stale",
+          action: "recover",
+        }),
+      )
+      expect(recovered.recovered[0]).toMatchObject({
+        status: "ambiguous",
+        reason: "stale-sending-recovered",
+      })
+      expect(recovered.notify.deliveries[0].status).toBe("ambiguous")
+      expect(sends).toBe(0)
+
+      const retry = payload(
+        await callTool(server, "opencode_delivery", {
+          sessionID: started.sessionID,
+          requestID: "req-delivery-stale",
+          action: "retry",
+        }),
+      )
+      expect(retry.retries[0]).toMatchObject({ status: "skipped", reason: "no-preflight-failures" })
+      expect(sends).toBe(0)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("a completed requestID cannot arm notify after the fact", async () => {
+    const backend = new Backend()
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      await callTool(
+        server,
+        "opencode_start_session",
+        { prompt: "task", requestID: "req-push-late", wait: false },
+        { threadId },
+      )
+      const late = await callTool(
+        server,
+        "opencode_start_session",
+        { prompt: "task", requestID: "req-push-late", wait: false, notify: true },
+        { threadId },
+      )
+      expect(late.isError).toBe(true)
+      expect(textOf(late)).toContain("already finished without notify")
+      expect(backend.promptCalls.length).toBe(1)
+    } finally {
+      server.stop()
+    }
+  })
+})
+
 describe("failure boundaries", () => {
   test("create failure records ambiguous delivery and never blind-recreates", async () => {
     const { backend, server } = harness()
@@ -319,6 +861,32 @@ describe("failure boundaries", () => {
       expect(retry.delivery).toBe("unknown")
       expect(backend.createAttempts).toBe(1) // no recreate after unknown create
       expect(backend.promptCalls.length).toBe(0)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test("an unknown create with no session cannot claim Codex push is armed", async () => {
+    const backend = new Backend()
+    const threadId = crypto.randomUUID()
+    backend.failCreate = true
+    const { server } = harness({ backend, pluginOptions: { codexDelivery: true } })
+    try {
+      setCodexReadiness("/repo", {
+        deliveryEnabled: true,
+        monitorAvailable: true,
+        monitorError: null,
+        verifyTarget: async () => {},
+      })
+      const receipt = payload(await callTool(
+        server,
+        "opencode_start_session",
+        { prompt: "task", requestID: "req-no-session-push", wait: false, notify: true },
+        { threadId },
+      ))
+      expect(receipt.state).toBe("unknown")
+      expect(receipt.sessionID).toBeNull()
+      expect(receipt.notify.state).toBe("session-unavailable")
     } finally {
       server.stop()
     }
@@ -560,6 +1128,8 @@ describe("legacy callers (no requestID)", () => {
       const started = payload(await callTool(server, "opencode_start_session", { prompt: "legacy" }))
       expect(started.status).toBe("started")
       expect(started.sessionID).toStartWith("ses_")
+      // Existing callers keep the original receipt shape: no notify contract.
+      expect("notify" in started).toBe(false)
       const create = backend.createCalls[0]
       expect(create.model).toEqual({ providerID: "opencode-go", id: "deepseek-v4.1-flash" })
       const ruleset = create.permissions as Array<{ action: string; resource: string; effect: string }>
