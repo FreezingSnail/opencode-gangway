@@ -5,6 +5,15 @@ import type { DeliveryTransport } from "./codex-delivery"
 
 export const DEFAULT_PORT = 4787
 
+const SERVER_INSTRUCTIONS = [
+  "Dispatch once with a stable requestID. Run one operation per session at a time.",
+  "Resume with opencode_wait or opencode_status (reconcile=true).",
+  "If needsInput is set, ask the user to respond in OpenCode, then resume.",
+  "Fetch output with opencode_result. If sessionID is missing, inspect by requestID with opencode_delivery.",
+  "For Codex push, pass notify=true and wait=false. End the turn without polling when a pending run has notify.state=armed.",
+  "After a timeout or unknown outcome, inspect before retrying.",
+].join(" ")
+
 export interface McpServerHandle {
   port: number
   stop(): void
@@ -160,7 +169,10 @@ function buildServer(
   pluginOptions: Record<string, unknown>,
   deliveryTransport?: DeliveryTransport,
 ): McpServer {
-  const server = new McpServer({ name: "gangway", version: "0.2.0" })
+  const server = new McpServer(
+    { name: "gangway", version: "0.2.0" },
+    { instructions: SERVER_INSTRUCTIONS },
+  )
 
   server.registerTool(
     "opencode_ping",

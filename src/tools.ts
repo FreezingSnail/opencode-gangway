@@ -619,20 +619,23 @@ function notificationFields(op: OperationRecord, codexDelivery: boolean) {
             : target?.status !== "available"
               ? "target-unverified"
               : "armed"
+  const fallback = op.sessionID
+    ? "Use opencode_wait or opencode_result with the same IDs."
+    : "Inspect the requestID with opencode_delivery."
   const hint =
     state === "plugin-disabled"
-      ? "Codex push is disabled for this location. Set the codexDelivery plugin option (or GANGWAY_CODEX_DELIVERY=1) and reload before dispatch."
+      ? `Codex push is disabled. ${fallback} To enable push, set codexDelivery and reload.`
       : state === "session-unavailable"
-        ? "OpenCode did not confirm a session ID for this operation, so no terminal outcome can be monitored. Inspect the recorded operation before relying on push."
+        ? `OpenCode did not confirm a session ID. ${fallback}`
       : state === "thread-missing"
-        ? "No Codex _meta.threadId was supplied. Codex sends it automatically; other MCP clients cannot receive this push."
+        ? `Codex _meta.threadId is missing. ${fallback}`
         : state === "monitor-unavailable"
-          ? "The Codex push monitor is not subscribed for this location, so no run outcome can be pushed. Use opencode_wait/opencode_result, or restore the event stream and reload."
+          ? `The Codex push monitor is unavailable. ${fallback}`
           : state === "target-unavailable"
-            ? "The calling Codex thread is not loaded on the shared App Server. Load it (and any required parent) before relying on the push; the recorded result remains available through opencode_result."
+            ? `The Codex thread or its parent is unavailable on the shared App Server. ${fallback}`
           : state === "target-unverified"
-            ? "Gangway has not verified that the calling Codex thread is loaded on the shared App Server. Keep this turn open and inspect status, or reconnect the shared App Server before relying on push."
-            : "End this turn after the receipt. One structured result is pushed to the bound Codex thread on completion; do not resubmit or poll."
+              ? `The Codex delivery target is unverified. ${fallback}`
+              : "End this turn for a pending run and await attention or completion. While waiting for push, do not resubmit or poll."
   return {
     notify: {
       requested: true,
@@ -1065,12 +1068,22 @@ export function registerBridgeTools(
   const titlePrefix = options.titlePrefix ?? TAG
   const permissions = options.inheritPermissions ? undefined : unattendedRuleset()
   const codexDelivery = options.codexDelivery ?? codexDeliveryEnabled(ctx.options)
+  const waitInput = z.boolean().optional().describe("Default false. Wait for completion, needsInput, or timeout.")
+  const timeoutInput = z.number().int().positive().optional().describe(
+    "Wait budget in milliseconds. Defaults to 45000. Leave room below the client timeout.",
+  )
+  const dispatchRequestID = z.string().optional().describe(
+    "Stable key for this operation. Identical retries reuse the record. Use a new key for changed input.",
+  )
+  const notifyInput = z.boolean().optional().describe(
+    "Codex only. Pass requestID and wait=false. For a pending run with notify.state=armed, end the turn and await attention or completion without polling. Otherwise, follow the receipt's notify.hint.",
+  )
 
   server.registerTool(
     "opencode_start_session",
     {
       description:
-        "Start an OpenCode implementation session (defaults to model opencode-go/deepseek-v4.1-flash) and send it an initial prompt. Returns immediately with a stable requestID/sessionID receipt. Pass requestID for idempotent, resumable dispatch; set notify=true to opt in to one Codex push of the structured result when the run finishes (requires requestID; the calling Codex thread is captured automatically). After an armed receipt the caller may end its turn: do not resubmit or poll. wait=true blocks as before.",
+        "Start or reuse an OpenCode session and send a prompt. Pass requestID for idempotent dispatch and a recorded operation handle. By default, return a receipt without waiting for completion. If sessionID is missing, inspect the requestID with opencode_delivery.",
       inputSchema: {
         prompt: z.string().describe("Implementation task for the OpenCode session"),
         sessionID: z.string().optional().describe("Attach to an existing session instead of creating one"),
@@ -1078,18 +1091,10 @@ export function registerBridgeTools(
         directory: z.string().optional().describe("Project directory; defaults to the plugin instance location"),
         agent: z.string().optional().describe("OpenCode agent ID"),
         model: z.string().optional().describe('"provider/modelID"; defaults to opencode-go/deepseek-v4.1-flash'),
-        wait: z.boolean().optional().describe("Block until the session goes idle"),
-        timeoutMs: z.number().int().positive().optional().describe("Max wait time"),
-        requestID: z
-          .string()
-          .optional()
-          .describe("Stable idempotency key; identical retries resolve to the same recorded operation"),
-        notify: z
-          .boolean()
-          .optional()
-          .describe(
-            "Opt in to one Codex push of the eventual structured result. Requires requestID; receipt reports whether session, monitor, and thread are ready",
-          ),
+        wait: waitInput,
+        timeoutMs: timeoutInput,
+        requestID: dispatchRequestID,
+        notify: notifyInput,
       },
     },
     async (args, extra) => {
@@ -1183,22 +1188,14 @@ export function registerBridgeTools(
     "opencode_prompt",
     {
       description:
-        "Send a follow-up prompt to an existing OpenCode session. Pass requestID for idempotent, resumable dispatch; set notify=true to opt in to one Codex push of the structured result when this turn finishes (requires requestID). After an armed receipt the caller may end its turn: do not resubmit or poll.",
+        "Send a follow-up prompt after the previous turn finishes. Use a new requestID for the new turn. By default, return a receipt without waiting for completion.",
       inputSchema: {
         sessionID: z.string().describe("Session ID (ses_...)"),
-        text: z.string(),
-        wait: z.boolean().optional(),
-        timeoutMs: z.number().int().positive().optional(),
-        requestID: z
-          .string()
-          .optional()
-          .describe("Stable idempotency key; identical retries resolve to the same recorded operation"),
-        notify: z
-          .boolean()
-          .optional()
-          .describe(
-            "Opt in to one Codex push of the eventual structured result. Requires requestID; receipt reports whether session, monitor, and thread are ready",
-          ),
+        text: z.string().describe("Follow-up prompt for the existing session"),
+        wait: waitInput,
+        timeoutMs: timeoutInput,
+        requestID: dispatchRequestID,
+        notify: notifyInput,
       },
     },
     async (args, extra) => {
@@ -1246,10 +1243,10 @@ export function registerBridgeTools(
     "opencode_wait",
     {
       description:
-        "Block until an OpenCode session finishes its current run, then return the latest assistant output. With requestID the wait binds to that operation's turn.",
+        "Wait for completion, needsInput, or timeout. Pass requestID to follow the recorded turn. If input is needed, have the user answer in OpenCode, then wait again with the same IDs. On timeout the run continues.",
       inputSchema: {
         sessionID: z.string(),
-        timeoutMs: z.number().int().positive().optional().describe("Defaults to 45 seconds (client-safe)"),
+        timeoutMs: timeoutInput,
         requestID: z.string().optional().describe("Bind the wait to a recorded operation instead of the latest turn"),
       },
     },
@@ -1282,7 +1279,7 @@ export function registerBridgeTools(
     "opencode_status",
     {
       description:
-        "Report an OpenCode session's state. With requestID returns compact recorded operation state (no transcript fetch unless reconcile=true), including the notify contract and durable codex delivery attempts. Without requestID returns session info plus a tail of the latest assistant output.",
+        "Check session state and any needsInput. With requestID, read recorded operation and Codex delivery state. Set reconcile=true to check the transcript for completion. Without requestID, get session info and an output tail.",
       inputSchema: {
         sessionID: z.string(),
         directory: z.string().optional().describe("Resolve this status request against this project location"),
@@ -1340,7 +1337,7 @@ export function registerBridgeTools(
     "opencode_result",
     {
       description:
-        "Return bounded assistant output. With requestID returns the recorded operation's own result and reports unchanged output instead of resending it (pass force=true to resend). The same response includes notify/codex delivery state, so a failed push can be inspected without resubmitting the run.",
+        "Read bounded output. With requestID, get the recorded turn's result and any pending needsInput or delivery state. unchanged=true omits repeated text. Use force=true to include it.",
       inputSchema: {
         sessionID: z.string(),
         maxChars: z.number().int().positive().optional().describe("Defaults to 20000"),
@@ -1413,7 +1410,7 @@ export function registerBridgeTools(
     "opencode_delivery",
     {
       description:
-        "Inspect or deliberately recover Codex push delivery for a recorded requestID. action=inspect (default) is read-only. action=deliver sends a first terminal result only when that output has no prior delivery record. action=retry resends only known preflight failures; accepted, rejected, sending and ambiguous entries are never resent. action=recover marks stale sending reservations ambiguous without sending a duplicate turn/start. Use directory to select the operation's location.",
+        "Inspect a recorded request when the session ID or expected Codex push is missing. Pass requestID and optionally directory. inspect is read-only. deliver sends a terminal result with no prior attempt. retry re-attempts a known preflight failure. recover marks stale sends ambiguous without sending.",
       inputSchema: {
         requestID: z.string().describe("Recorded operation requestID"),
         directory: z.string().optional().describe("Resolve this recovery request against the operation's project location"),
